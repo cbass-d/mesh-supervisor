@@ -1,0 +1,44 @@
+name: ci 
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: &docs
+      - 'LICENSE-*'
+      - '.gitignore'
+  pull_request:
+    paths-ignore: *docs
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt + clippy + build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+      
+      - name: Cache Nix Store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: cargo fmt
+        run: nix develop -c cargo fmt --all -- --check
+
+      - name: cargo clippy (workspace)
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo build (release)
+        run: nix develop -c cargo build --workspace --release
+
+      - name: cargo test
+        run: nix develop -c cargo test --workspace
+
