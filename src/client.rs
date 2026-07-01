@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -15,6 +15,8 @@ const MAX_RETRIES: u32 = 5;
 const BASE_DELAY: Duration = Duration::from_millis(100);
 /// Maximum delay between retries.
 const MAX_DELAY: Duration = Duration::from_secs(2);
+/// How long to wait for a response after a stream is open.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Retry `f` with exponential backoff until it succeeds or `max_retries` is
 /// exhausted. Only transient transport setup errors should be returned as `Err`;
@@ -67,7 +69,9 @@ pub async fn request(
     .await?;
 
     write_msg(&mut send, &req).await?;
-    let resp = read_msg::<Response>(&mut recv).await?;
+    let resp = tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+        .await
+        .context("timed out waiting for response")??;
 
     conn.close(0u32.into(), b"done");
 
@@ -95,7 +99,10 @@ pub async fn subscribe(
     .await?;
 
     write_msg(&mut send, &Request::Subscribe { id }).await?;
-    match read_msg::<Response>(&mut recv).await? {
+    match tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+        .await
+        .context("timed out waiting for subscribe ack")??
+    {
         Response::Ack => {}
         Response::Error(e) => bail!("subscribe rejected: {e:?}"),
         other => bail!("unexpected response: {other:?}"),

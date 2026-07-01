@@ -25,6 +25,9 @@ const REFILL: f64 = 10.0;
 const MAX_BUCKETS: usize = 2048;
 /// Idle time after which a peer's bucket can be reclaimed.
 const EVICTION_TTL: Duration = Duration::from_secs(90);
+/// How long the supervisor waits for a client to send a request after opening a
+/// bidi stream. Prevents slowloris-style hangs.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One token-bucket entry.
 #[derive(Debug)]
@@ -140,13 +143,17 @@ impl ProtocolHandler for Supervisor {
             warn!(%remote, "connection rate limited");
             Err(ControlError::RateLimited)
         } else {
-            match read_msg::<Request>(&mut recv).await {
+            match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_msg::<Request>(&mut recv)).await {
+                Ok(Ok(req)) => self.authorize(remote, &req).map(|()| req),
                 // Don't reflect the parser's detail back to the client; log it instead.
-                Err(e) => {
+                Ok(Err(e)) => {
                     debug!(%remote, "malformed request: {e}");
                     Err(ControlError::BadRequest("malformed request".into()))
                 }
-                Ok(req) => self.authorize(remote, &req).map(|()| req),
+                Err(_) => {
+                    warn!(%remote, "timed out waiting for request");
+                    Err(ControlError::Timeout)
+                }
             }
         };
 

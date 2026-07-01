@@ -144,6 +144,9 @@ pub enum ControlError {
     RateLimited,
     SpawnFailed(String),
     BadRequest(String),
+    /// The supervisor closed the connection because the client was too slow to
+    /// send a request or complete a handshake.
+    Timeout,
 }
 
 /// Write one length-prefixed (u32 BE) postcard message. The single framing for
