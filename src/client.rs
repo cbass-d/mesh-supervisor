@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::{CONTROL_ALPN, Request, Response, read_msg, write_msg};
 
@@ -110,6 +110,43 @@ pub async fn subscribe(
 
     tokio::io::copy(&mut recv, out).await?;
     out.flush().await?;
+    conn.close(0u32.into(), b"done");
+
+    Ok(())
+}
+
+/// Pipe `input` into a process's stdin over a raw QUIC byte stream.
+///
+/// Connection establishment is retried with exponential backoff. The stream is
+/// closed (EOF) when `input` reaches EOF. The supervisor's final `Ack` or `Error`
+/// response is read before returning.
+pub async fn stdin_stream(
+    endpoint: &Endpoint,
+    target: impl Into<EndpointAddr>,
+    id: u64,
+    input: &mut (impl AsyncRead + Unpin),
+) -> Result<()> {
+    let target = target.into();
+    let (conn, mut send, mut recv) = with_retry(MAX_RETRIES, BASE_DELAY, MAX_DELAY, || async {
+        let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
+        let (send, recv) = conn.open_bi().await?;
+        Ok((conn, send, recv))
+    })
+    .await?;
+
+    write_msg(&mut send, &Request::StdinStream { id }).await?;
+    tokio::io::copy(input, &mut send).await?;
+    send.finish()?;
+
+    match tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+        .await
+        .context("timed out waiting for stdin response")??
+    {
+        Response::Ack => {}
+        Response::Error(e) => bail!("stdin stream rejected: {e:?}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+
     conn.close(0u32.into(), b"done");
 
     Ok(())

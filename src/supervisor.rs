@@ -168,6 +168,17 @@ impl ProtocolHandler for Supervisor {
                     .await
                     .map_err(|e| AcceptError::from_boxed(e.into()))?;
             }
+            // StdinStream is long-lived in the other direction: copy raw bytes from
+            // the QUIC recv stream into the child's stdin, then Ack.
+            Ok(Request::StdinStream { id }) => {
+                let resp = match self.procs.pipe_stdin(id, &mut recv).await {
+                    Ok(()) => Response::Ack,
+                    Err(e) => Response::Error(e),
+                };
+                write_msg(&mut send, &resp)
+                    .await
+                    .map_err(|e| AcceptError::from_boxed(e.into()))?;
+            }
             // Everything else is one request, one response.
             Ok(req) => {
                 let resp = self.dispatch(remote, req).await;
@@ -229,16 +240,13 @@ impl Supervisor {
                 Ok(()) => Response::Ack,
                 Err(e) => Response::Error(e),
             },
-            Request::Stdin { id, data } => match self.procs.write_stdin(id, &data).await {
-                Ok(()) => Response::Ack,
-                Err(e) => Response::Error(e),
-            },
             Request::Forget { id } => match self.procs.forget(id) {
                 Ok(()) => Response::Ack,
                 Err(e) => Response::Error(e),
             },
             Request::List => Response::List(self.procs.snapshot()),
             Request::Subscribe { .. } => unreachable!("Subscribe is handled in accept()"),
+            Request::StdinStream { .. } => unreachable!("StdinStream is handled in accept()"),
         }
     }
 

@@ -96,17 +96,12 @@ async fn spawn_then_list_over_loopback() {
         })
     ));
 
-    // Stdin: write a frame (sleep ignores it, but the pipe accepts the bytes).
-    let req = Request::Stdin {
-        id,
-        data: b"hi\n".to_vec(),
-    };
-    assert_eq!(
-        client::request(&cl, addr.clone(), req)
-            .await
-            .expect("stdin"),
-        Response::Ack
-    );
+    // Stdin: stream a small frame (sleep ignores it, but the pipe accepts the bytes).
+    let data = b"hi\n";
+    let mut input = std::io::Cursor::new(&data[..]);
+    client::stdin_stream(&cl, addr.clone(), id, &mut input)
+        .await
+        .expect("stdin");
 
     // Signal SIGTERM, then poll until the reaper records the exit.
     let req = Request::Signal { id, sig: 15 };
@@ -314,6 +309,50 @@ async fn subscribe_streams_stdout_to_two_clients() {
 
     assert_eq!(buf_a, b"hello\nworld\n");
     assert_eq!(buf_b, b"hello\nworld\n");
+
+    cl.close().await;
+    router.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn stdin_stream_pipes_large_input() {
+    use std::io::Cursor;
+
+    let server = test_endpoint(vec![CONTROL_ALPN.to_vec()]).await;
+    let router = Router::builder(server.clone())
+        .accept(
+            CONTROL_ALPN,
+            Supervisor::new(ProcessManager::new(), Authz::open()),
+        )
+        .spawn();
+    let addr = server.addr();
+    let cl = test_endpoint(vec![]).await;
+
+    let req = Request::Spawn(Spec {
+        cmd: "cat".into(),
+        ..Default::default()
+    });
+    let id = match client::request(&cl, addr.clone(), req)
+        .await
+        .expect("spawn")
+    {
+        Response::Spawned { id, .. } => id,
+        other => panic!("expected Spawned, got {other:?}"),
+    };
+
+    // More than MAX_FRAME to prove stdin is no longer capped at 64 KiB.
+    let input = vec![0xabu8; 128 * 1024];
+    let mut input_cursor = Cursor::new(&input);
+    let mut output = Vec::new();
+
+    let (stream_res, sub_res) = tokio::join!(
+        client::stdin_stream(&cl, addr.clone(), id, &mut input_cursor),
+        client::subscribe(&cl, addr.clone(), id, &mut output),
+    );
+    stream_res.expect("stdin stream");
+    sub_res.expect("subscribe");
+
+    assert_eq!(output, input, "stdout should echo the full stdin stream");
 
     cl.close().await;
     router.shutdown().await.expect("shutdown");

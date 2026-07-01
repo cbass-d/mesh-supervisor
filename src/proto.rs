@@ -65,9 +65,9 @@ pub enum Request {
     Stop {
         id: Handle,
     },
-    Stdin {
+    /// Open a raw byte stream on this connection and pipe it to the child's stdin.
+    StdinStream {
         id: Handle,
-        data: Vec<u8>,
     },
     Query {
         id: Handle,

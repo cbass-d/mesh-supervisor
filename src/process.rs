@@ -20,7 +20,7 @@ use nix::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt},
     process::{Child, ChildStdin, Command},
     sync::{Mutex as AsyncMutex, broadcast},
 };
@@ -653,9 +653,14 @@ impl ProcessManager {
         })
     }
 
-    /// Write bytes to a process's stdin.
-    pub async fn write_stdin(&self, id: Handle, data: &[u8]) -> Result<(), ControlError> {
-        // Hold the table lock only to clone the per-handle lock, then write off-lock.
+    /// Pipe a raw byte stream into a process's stdin until EOF or the child closes
+    /// its read end. The per-process stdin lock is held for the duration so that only
+    /// one writer is active at a time.
+    pub async fn pipe_stdin<R>(&self, id: Handle, recv: &mut R) -> Result<(), ControlError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        // Hold the table lock only to clone the per-handle lock, then copy off-lock.
         let stdin = {
             let map = self.0.procs.lock();
             map.get(&id)
@@ -669,13 +674,17 @@ impl ProcessManager {
             return Err(ControlError::BadRequest("stdin unavailable".into()));
         };
 
-        match s.write_all(data).await {
-            Ok(()) => Ok(()),
+        match tokio::io::copy(recv, s).await {
+            Ok(_) => {
+                // EOF on the QUIC stream: close the child's stdin so it sees EOF too.
+                *guard = None;
+                Ok(())
+            }
             Err(e) => {
                 *guard = None; // broken pipe (child closed its read end); mark closed
-                warn!(handle = id, "stdin write failed: {e}");
+                warn!(handle = id, "stdin pipe closed: {e}");
 
-                Err(ControlError::BadRequest("stdin write failed".into()))
+                Err(ControlError::BadRequest("stdin pipe closed".into()))
             }
         }
     }
@@ -803,16 +812,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdin_write_succeeds() {
+    async fn stdin_pipe_succeeds() {
+        use std::io::Cursor;
+
         let pm = ProcessManager::new();
         let (id, _) = pm.spawn(spec("cat", &[])).unwrap();
 
-        pm.write_stdin(id, b"hello\n").await.unwrap();
+        let data = b"hello\n";
+        let mut input = Cursor::new(&data[..]);
+        pm.pipe_stdin(id, &mut input).await.unwrap();
 
-        // cat keeps running (no EOF yet)
-        assert!(matches!(pm.query(id).unwrap().state, ProcState::Running));
-
-        pm.kill_all().await;
+        // cat exits once its stdin reaches EOF.
+        assert!(wait_until_exited(&pm, id).await);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use mesh_supervisor::{
     cgroup::Cgroups, client, endpoint, process::ProcessManager, proto, store::Store, supervisor,
     telemetry,
 };
-use tokio::io::AsyncReadExt;
+
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -491,25 +491,21 @@ async fn main() -> Result<()> {
                 .parse()?;
             let id = *sub.get_one::<u64>("handle").expect("required arg");
 
-            // Read this command's stdin to EOF and send it as one frame.
-            let mut data = Vec::new();
-            tokio::io::stdin().read_to_end(&mut data).await?;
-
-            info!(%target, handle = id, bytes = data.len(), "sending stdin to process...");
+            info!(%target, handle = id, "streaming stdin to process...");
             let relay = relay_url(sub)?;
             let (endpoint, _book) = endpoint::build_endpoint(vec![], None, relay.clone()).await?;
-            let resp = client::request(
+            let result = client::stdin_stream(
                 &endpoint,
                 dial_addr(target, &relay),
-                proto::Request::Stdin { id, data },
+                id,
+                &mut tokio::io::stdin(),
             )
-            .await?;
+            .await;
             endpoint.close().await;
 
-            match resp {
-                proto::Response::Ack => info!(handle = id, "stdin delivered"),
-                proto::Response::Error(e) => error!("stdin failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+            match result {
+                Ok(()) => info!(handle = id, "stdin delivered"),
+                Err(e) => error!("stdin failed: {e:?}"),
             }
 
             Ok(())
