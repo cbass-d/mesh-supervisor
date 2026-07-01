@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use p2p_telemtry::{
+use mesh_supervisor::{
     process::ProcessManager,
     proto::{ProcState, RestartPolicy, Spec},
 };

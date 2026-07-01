@@ -1,2 +1,7 @@
 /target
-p2p-telemetry.redb
+mesh-supervisor.redb
+
+# Ignore all Markdown files except README.md and AGENTS.md
+*.md
+!README.md
+!AGENTS.md

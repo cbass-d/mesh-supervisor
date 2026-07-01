@@ -1994,6 +1994,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "mesh-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "clap",
+ "iroh",
+ "iroh-gossip",
+ "iroh-mdns-address-lookup",
+ "n0-future",
+ "nix",
+ "parking_lot",
+ "postcard",
+ "redb",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2451,28 +2473,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "p2p-telemtry"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bytes",
- "clap",
- "iroh",
- "iroh-gossip",
- "iroh-mdns-address-lookup",
- "n0-future",
- "nix",
- "parking_lot",
- "postcard",
- "redb",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "papaya"

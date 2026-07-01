@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use p2p_telemtry::{process::ProcessManager, proto::Spec, store::Store};
+use mesh_supervisor::{process::ProcessManager, proto::Spec, store::Store};
 
 /// Spawn `sh -c <script>` isolated and return its full stdout, or `None` if the
 /// kernel rejects the namespace setup (→ skip).

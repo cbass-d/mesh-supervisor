@@ -18,7 +18,7 @@ use crate::process::ProcessManager;
 use crate::proto::{Handle, ProcInfo};
 
 /// Well-known label hashed into the default public topic when no secret is set.
-const DEFAULT_TOPIC_LABEL: &str = "p2p-telemtry/telemetry/1";
+const DEFAULT_TOPIC_LABEL: &str = "mesh-supervisor/telemetry/1";
 
 /// The topic to use: `blake3(secret)` when a shared secret is set (private — peers
 /// without the secret can't compute it, so they can't join/read/inject), else
@@ -38,12 +38,14 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TICK_AGE_MS: u64 = 10_000;
 
 /// A telemetry tick's authenticated content: one supervisor's process table at a
-/// moment in time. `from` and `ts` are bound into the signed payload, so neither
-/// can be forged (see [`sign_tick`] / [`open_tick`]).
+/// moment in time. `from`, `ts`, and `seq` are bound into the signed payload, so
+/// none can be forged (see [`sign_tick`] / [`open_tick`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tick {
     pub from: EndpointId,
     pub ts: u64,
+    /// Per-publisher monotonic sequence number. Resets on supervisor restart.
+    pub seq: u64,
     pub stats: Vec<ProcInfo>,
 }
 
@@ -61,6 +63,23 @@ fn fresh(ts: u64, now: u64) -> bool {
     now.abs_diff(ts) <= MAX_TICK_AGE_MS
 }
 
+/// Decide whether to accept a decoded tick. Rejects stale timestamps and any
+/// sequence number that is not strictly greater than the last accepted tick from
+/// the same publisher. On acceptance, updates `latest_seq`.
+fn accept_tick(tick: &Tick, now: u64, latest_seq: &mut HashMap<EndpointId, u64>) -> bool {
+    if !fresh(tick.ts, now) {
+        return false;
+    }
+    if latest_seq
+        .get(&tick.from)
+        .is_some_and(|&prev| tick.seq <= prev)
+    {
+        return false;
+    }
+    latest_seq.insert(tick.from, tick.seq);
+    true
+}
+
 /// Wire form: the serialized `Tick` body plus a signature over those exact bytes.
 #[derive(Serialize, Deserialize)]
 struct SignedTick {
@@ -69,10 +88,13 @@ struct SignedTick {
 }
 
 /// Serialize and sign a tick (authored by `secret`'s id) for broadcast.
-pub fn sign_tick(secret: &SecretKey, stats: Vec<ProcInfo>) -> Result<Vec<u8>> {
+/// `seq` is the per-publisher monotonic sequence number; callers must increment
+/// it for every tick and never reuse a value.
+pub fn sign_tick(secret: &SecretKey, seq: u64, stats: Vec<ProcInfo>) -> Result<Vec<u8>> {
     let body = postcard::to_allocvec(&Tick {
         from: secret.public(),
         ts: now_millis(),
+        seq,
         stats,
     })?;
     let sig = secret.sign(&body);
@@ -94,6 +116,7 @@ pub fn open_tick(content: &[u8]) -> Result<Tick> {
 /// `secret`. Runs until the topic closes; errors are logged, never propagated.
 pub async fn publish_loop(mut topic: GossipTopic, secret: SecretKey, procs: ProcessManager) {
     let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
+    let mut seq = 0u64;
 
     loop {
         interval.tick().await;
@@ -102,7 +125,8 @@ pub async fn publish_loop(mut topic: GossipTopic, secret: SecretKey, procs: Proc
             continue; // nothing to report yet
         }
 
-        match sign_tick(&secret, stats) {
+        seq += 1;
+        match sign_tick(&secret, seq, stats) {
             Ok(bytes) => {
                 if let Err(e) = topic.broadcast(bytes.into()).await {
                     warn!("telemetry broadcast failed: {e}");
@@ -114,10 +138,10 @@ pub async fn publish_loop(mut topic: GossipTopic, secret: SecretKey, procs: Proc
 }
 
 /// Print telemetry ticks from the topic until the stream ends. Drops ticks that
-/// fail signature verification, fall outside the freshness window, or aren't newer
-/// than the last accepted tick from the same publisher (replay protection).
+/// fail signature verification, fall outside the freshness window, or replay an
+/// already-seen sequence number from the same publisher.
 pub async fn watch_loop(mut topic: GossipTopic) -> Result<()> {
-    let mut latest: HashMap<EndpointId, u64> = HashMap::new();
+    let mut latest_seq: HashMap<EndpointId, u64> = HashMap::new();
     // Last (cpu_usec, ts) per (publisher, handle) for computing a CPU rate.
     let mut prev: HashMap<(EndpointId, Handle), (u64, u64)> = HashMap::new();
 
@@ -125,13 +149,10 @@ pub async fn watch_loop(mut topic: GossipTopic) -> Result<()> {
         match event {
             Ok(Event::Received(msg)) => match open_tick(&msg.content) {
                 Ok(tick) => {
-                    let stale = !fresh(tick.ts, now_millis())
-                        || latest.get(&tick.from).is_some_and(|&prev| tick.ts <= prev);
-                    if stale {
-                        warn!(from = %tick.from, ts = tick.ts, "dropping stale/replayed tick");
+                    if !accept_tick(&tick, now_millis(), &mut latest_seq) {
+                        warn!(from = %tick.from, ts = tick.ts, seq = tick.seq, "dropping stale/replayed tick");
                         continue;
                     }
-                    latest.insert(tick.from, tick.ts);
 
                     for s in &tick.stats {
                         // Diff cumulative cpu_usec against our last sample for a rate.
@@ -208,8 +229,9 @@ mod tests {
             restarts: 0,
         }];
 
-        let tick = open_tick(&sign_tick(&sk, stats).unwrap()).unwrap();
+        let tick = open_tick(&sign_tick(&sk, 1, stats).unwrap()).unwrap();
         assert_eq!(tick.from, sk.public());
+        assert_eq!(tick.seq, 1);
         assert_eq!(tick.stats.len(), 1);
 
         // Forge: claim a victim's id but sign with a different key → rejected.
@@ -217,6 +239,7 @@ mod tests {
         let body = postcard::to_allocvec(&Tick {
             from: victim,
             ts: 0,
+            seq: 1,
             stats: vec![],
         })
         .unwrap();
@@ -226,5 +249,32 @@ mod tests {
         })
         .unwrap();
         assert!(open_tick(&forged).is_err(), "forged tick must be rejected");
+    }
+
+    #[test]
+    fn accept_tick_rejects_replay_and_reordering() {
+        let id = SecretKey::generate().public();
+        let now = 1_000_000;
+        let mut latest = HashMap::new();
+
+        let tick = |seq: u64| Tick {
+            from: id,
+            ts: now,
+            seq,
+            stats: vec![],
+        };
+
+        assert!(accept_tick(&tick(1), now, &mut latest));
+        // Same or lower sequence number is a replay.
+        assert!(!accept_tick(&tick(1), now, &mut latest), "duplicate seq");
+        assert!(!accept_tick(&tick(0), now, &mut latest), "regressed seq");
+        // Higher sequence number is accepted.
+        assert!(accept_tick(&tick(2), now, &mut latest));
+        // Stale timestamp is still rejected even with a fresh sequence number.
+        assert!(!accept_tick(
+            &tick(3),
+            now + MAX_TICK_AGE_MS + 1,
+            &mut latest
+        ));
     }
 }

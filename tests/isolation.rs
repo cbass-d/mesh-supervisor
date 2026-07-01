@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use p2p_telemtry::{
+use mesh_supervisor::{
     cgroup::Cgroups,
     process::ProcessManager,
     proto::{Limits, Spec},
@@ -62,7 +62,7 @@ async fn child_is_capped_and_torn_down() {
         .trim();
 
     assert!(
-        rel.ends_with(&format!("/p2p-telemetry/{handle}")),
+        rel.ends_with(&format!("/mesh-supervisor/{handle}")),
         "child not in its leaf cgroup: {rel}"
     );
 

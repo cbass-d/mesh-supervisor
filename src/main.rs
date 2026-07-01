@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{ArgMatches, Command, arg};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, protocol::Router};
 use iroh_gossip::net::Gossip;
-use p2p_telemtry::{
+use mesh_supervisor::{
     cgroup::Cgroups, client, endpoint, process::ProcessManager, proto, store::Store, supervisor,
     telemetry,
 };
@@ -81,7 +81,7 @@ fn init_tracing() {
 }
 
 fn cli() -> Command {
-    Command::new("p2p-telemetry")
+    Command::new("mesh-supervisor")
         .about("distributed process-control + telemetry plane over an iroh P2P mesh")
         .long_about(
             "Each node runs a supervisor that owns an iroh (QUIC) endpoint and the \
@@ -107,19 +107,19 @@ fn cli() -> Command {
         .after_help(
             "EXAMPLES:\n  \
              # Run as a supervisor; prints this node's EndpointId\n  \
-             p2p-telemetry supervise\n\n  \
+             mesh-supervisor supervise\n\n  \
              # Client: spawn a process on a remote supervisor\n  \
-             p2p-telemetry spawn <endpoint-id> -- sleep 60\n\n  \
+             mesh-supervisor spawn <endpoint-id> -- sleep 60\n\n  \
              # Client: list / inspect handles on a supervisor\n  \
-             p2p-telemetry list <endpoint-id>\n  \
-             p2p-telemetry query <endpoint-id> <handle>",
+             mesh-supervisor list <endpoint-id>\n  \
+             mesh-supervisor query <endpoint-id> <handle>",
         )
         .subcommand(
             Command::new("supervise")
                 .about("run as a supervisor: bind an endpoint and accept control connections")
                 .arg(
                     arg!(--store <path> "path to the redb store (persists identity + process records)")
-                        .default_value("p2p-telemetry.redb"),
+                        .default_value("mesh-supervisor.redb"),
                 )
                 .arg(
                     arg!(--allow <id> ... "EndpointId(s) allowed full control of this supervisor")
@@ -313,8 +313,8 @@ async fn main() -> Result<()> {
             ));
 
             info!(endpoint_id = %id, "supervisor up (LAN/mDNS, persistent identity)");
-            info!("dial with: p2p-telemetry list {id}");
-            info!("watch telemetry with: p2p-telemetry watch {id}");
+            info!("dial with: mesh-supervisor list {id}");
+            info!("watch telemetry with: mesh-supervisor watch {id}");
             info!("waiting for control connections (Ctrl-C to quit)");
 
             tokio::signal::ctrl_c().await?;

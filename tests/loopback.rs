@@ -5,14 +5,14 @@ use std::time::Duration;
 use iroh::{
     Endpoint, SecretKey, address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
 };
-use n0_future::StreamExt;
-use p2p_telemtry::{
+use mesh_supervisor::{
     client,
     process::ProcessManager,
     proto::{CONTROL_ALPN, ControlError, ProcInfo, ProcState, Request, Response, Spec},
     supervisor::{Authz, Supervisor},
     telemetry,
 };
+use n0_future::StreamExt;
 
 /// Bind a LAN-less endpoint (no mDNS)
 async fn test_endpoint(alpns: Vec<Vec<u8>>) -> Endpoint {
@@ -266,6 +266,7 @@ async fn telemetry_tick_reaches_watcher_over_gossip() {
     .expect("no telemetry tick within timeout");
 
     assert_eq!(tick.from, server_id);
+    assert!(tick.seq > 0, "tick must carry a positive sequence number");
     assert_eq!(tick.stats.len(), 1);
     assert_eq!(tick.stats[0].handle, id);
     assert_eq!(tick.stats[0].state, ProcState::Running);

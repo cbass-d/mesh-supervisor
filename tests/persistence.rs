@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use p2p_telemtry::{
+use mesh_supervisor::{
     process::{ProcessManager, Record},
     proto::{ProcState, Spec},
     store::Store,

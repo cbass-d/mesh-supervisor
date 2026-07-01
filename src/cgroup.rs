@@ -13,7 +13,7 @@ use crate::proto::{Handle, Limits, Usage};
 const MOUNT: &str = "/sys/fs/cgroup";
 
 /// Fixed name so a restart can find and sweep a previous run's leftovers.
-const GROUP: &str = "p2p-telemetry";
+const GROUP: &str = "mesh-supervisor";
 
 /// Parent cgroup under which each child gets a leaf with `memory.max`.
 #[derive(Debug)]

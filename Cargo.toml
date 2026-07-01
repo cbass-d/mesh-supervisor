@@ -1,5 +1,5 @@
 [package]
-name = "p2p-telemtry"
+name = "mesh-supervisor"
 version = "0.1.0"
 edition = "2024"
 

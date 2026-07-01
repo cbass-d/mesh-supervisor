@@ -1,4 +1,4 @@
-# p2p-telemtry
+# mesh-supervisor
 
 A distributed process-control + telemetry plane over an [iroh](https://iroh.computer) (QUIC) P2P mesh.
 
@@ -88,7 +88,7 @@ topic, env `P2P_TOPIC_SECRET`) apply to every subcommand.
 
 ## Design notes
 
-- **Identity & state persist** (redb store, default `p2p-telemetry.redb`): the node's
+- **Identity & state persist** (redb store, default `mesh-supervisor.redb`): the node's
   secret key and process records survive a restart, so `EndpointId` and handles are stable.
   A process that was running when the supervisor died reloads as **Stale** (its child is
   gone — children die with the supervisor; no re-adopt).
