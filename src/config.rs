@@ -154,11 +154,14 @@ impl Default for TelemetryConfig {
 }
 
 impl TelemetryConfig {
+    /// These keys are defined per-role (`sample-interval-ms` is supervisor-only,
+    /// clients only get `max-tick-age-ms`), so use `try_get_one`: `get_one` on a
+    /// key the subcommand doesn't define panics at runtime.
     pub fn with_cli_overrides(&mut self, matches: &ArgMatches) {
-        if let Some(ms) = matches.get_one::<u64>("sample-interval-ms") {
+        if let Ok(Some(ms)) = matches.try_get_one::<u64>("sample-interval-ms") {
             self.sample_interval = Duration::from_millis(*ms);
         }
-        if let Some(ms) = matches.get_one::<u64>("max-tick-age-ms") {
+        if let Ok(Some(ms)) = matches.try_get_one::<u64>("max-tick-age-ms") {
             self.max_tick_age = Duration::from_millis(*ms);
         }
     }

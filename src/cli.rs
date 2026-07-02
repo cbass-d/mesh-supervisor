@@ -276,3 +276,88 @@ pub fn cli() -> Command {
                 ),
         ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::cli;
+    use mesh_supervisor::config::{ClientConfig, SupervisorConfig};
+
+    /// Drive the real parser for every subcommand and apply its config
+    /// overrides. Catches what only explodes at runtime: duplicate arg ids
+    /// (clap's uniqueness assert) and `get_one` on a key the subcommand
+    /// doesn't define.
+    #[test]
+    fn every_subcommand_parses_and_applies_config_overrides() {
+        let id = iroh::SecretKey::generate().public().to_string();
+        let id = id.as_str();
+
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["mesh-supervisor", "supervise", "--open"],
+            vec!["mesh-supervisor", "spawn", id, "true"],
+            vec!["mesh-supervisor", "list", id],
+            vec!["mesh-supervisor", "query", id, "1"],
+            vec!["mesh-supervisor", "signal", id, "1", "15"],
+            vec!["mesh-supervisor", "stop", id, "1"],
+            vec!["mesh-supervisor", "stdin", id, "1"],
+            vec!["mesh-supervisor", "subscribe", id, "1"],
+            vec!["mesh-supervisor", "forget", id, "1"],
+            vec!["mesh-supervisor", "watch", id],
+        ];
+
+        for argv in cases {
+            let matches = cli()
+                .try_get_matches_from(&argv)
+                .unwrap_or_else(|e| panic!("{argv:?} failed to parse: {e}"));
+            let (name, sub) = matches.subcommand().expect("subcommand required");
+            if name == "supervise" {
+                SupervisorConfig::default().with_cli_overrides(sub);
+            } else {
+                ClientConfig::default().with_cli_overrides(sub);
+            }
+        }
+    }
+
+    /// Flags override the struct defaults; untouched knobs keep them.
+    #[test]
+    fn cli_flags_override_config_defaults() {
+        let id = iroh::SecretKey::generate().public().to_string();
+
+        let matches = cli()
+            .try_get_matches_from([
+                "mesh-supervisor",
+                "list",
+                &id,
+                "--read-timeout",
+                "7",
+                "--connect-retries",
+                "9",
+            ])
+            .expect("parse list");
+        let (_, sub) = matches.subcommand().expect("subcommand");
+        let mut cfg = ClientConfig::default();
+        cfg.with_cli_overrides(sub);
+        assert_eq!(cfg.read_timeout, Duration::from_secs(7));
+        assert_eq!(cfg.max_retries, 9);
+        assert_eq!(
+            cfg.retry_base_delay,
+            ClientConfig::default().retry_base_delay,
+            "untouched knob must keep its default"
+        );
+
+        let matches = cli()
+            .try_get_matches_from([
+                "mesh-supervisor",
+                "supervise",
+                "--open",
+                "--sample-interval-ms",
+                "250",
+            ])
+            .expect("parse supervise");
+        let (_, sub) = matches.subcommand().expect("subcommand");
+        let mut cfg = SupervisorConfig::default();
+        cfg.with_cli_overrides(sub);
+        assert_eq!(cfg.telemetry.sample_interval, Duration::from_millis(250));
+    }
+}
