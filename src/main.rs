@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use clap::{ArgMatches, Command, arg};
-use iroh::{EndpointAddr, EndpointId, RelayUrl, protocol::Router};
+use iroh::{
+    EndpointAddr, EndpointId, RelayUrl, address_lookup::memory::MemoryLookup, protocol::Router,
+};
 use iroh_gossip::net::Gossip;
 use mesh_supervisor::{
     cgroup::Cgroups, client, config::ClientConfig, config::SupervisorConfig, endpoint,
@@ -34,15 +36,10 @@ fn dial_addr(id: EndpointId, relay: &Option<RelayUrl>) -> EndpointAddr {
 /// Shared setup for every client subcommand: parse config, build an endpoint,
 /// send one request, and tear the endpoint down. Returns the supervisor response.
 async fn client_call(sub: &ArgMatches, req: proto::Request) -> Result<proto::Response> {
-    let mut cfg = ClientConfig::default();
-    cfg.with_cli_overrides(sub);
-    let target = *sub.get_one::<EndpointId>("endpoint").expect("required arg");
-    let relay = sub.get_one::<RelayUrl>("relay").cloned();
-
-    let (endpoint, _book) = endpoint::build_endpoint(vec![], None, relay.clone()).await?;
-    let resp = client::request(&endpoint, dial_addr(target, &relay), req, &cfg).await?;
-    endpoint.close().await;
-    Ok(resp)
+    client_streaming(sub, |endpoint, addr, cfg| async move {
+        client::request(&endpoint, addr, req, &cfg).await
+    })
+    .await
 }
 
 /// Shared setup for streaming client subcommands (`stdin`, `subscribe`). The
@@ -84,6 +81,25 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {s:?} overflows u64"))
 }
 
+/// Uniform tail for one-shot subcommands: an `Error` response means the verb
+/// failed; anything else is a protocol surprise worth a warning.
+fn report_failure(verb: &str, resp: proto::Response) {
+    match resp {
+        proto::Response::Error(e) => error!("{verb} failed: {e:?}"),
+        other => warn!("unexpected response: {other:?}"),
+    }
+}
+
+/// On WAN, seed peers' relay addrs into the address book so gossip can reach
+/// bootstrap peers by id alone.
+fn seed_relay_addrs(book: &MemoryLookup, relay: &Option<RelayUrl>, peers: &[EndpointId]) {
+    if let Some(r) = relay {
+        for id in peers {
+            book.add_endpoint_info(EndpointAddr::new(*id).with_relay_url(r.clone()));
+        }
+    }
+}
+
 /// Render a process's memory usage in MiB, or `-` when unavailable (no cgroup).
 fn mem_str(usage: Option<proto::Usage>) -> String {
     usage.map_or_else(
@@ -96,6 +112,17 @@ fn mem_str(usage: Option<proto::Usage>) -> String {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// `<endpoint>` positional: the supervisor to dial.
+fn endpoint_arg() -> clap::Arg {
+    arg!(<endpoint> "EndpointId of the supervisor to dial")
+        .value_parser(clap::value_parser!(EndpointId))
+}
+
+/// `<handle>` positional: the target process handle.
+fn handle_arg() -> clap::Arg {
+    arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))
 }
 
 /// Client-side policy flags (retries, read timeout, telemetry freshness).
@@ -247,10 +274,7 @@ fn cli() -> Command {
         .subcommand(client_args(
             Command::new("spawn")
                 .about("client: launch a process on a remote supervisor")
-                .arg(
-                    arg!(<endpoint> "EndpointId of the supervisor to dial")
-                        .value_parser(clap::value_parser!(EndpointId)),
-                )
+                .arg(endpoint_arg())
                 .arg(
                     arg!(--mem <size> "memory cap, e.g. 256M (K/M/G suffixes)")
                         .value_parser(parse_size)
@@ -287,19 +311,19 @@ fn cli() -> Command {
         .subcommand(client_args(
             Command::new("list")
                 .about("client: list the process handles tracked by a supervisor")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId))),
+                .arg(endpoint_arg()),
         ))
         .subcommand(client_args(
             Command::new("query")
                 .about("client: query a process's status")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))),
+                .arg(endpoint_arg())
+                .arg(handle_arg()),
         ))
         .subcommand(client_args(
             Command::new("signal")
                 .about("client: send a signal to a process")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64)))
+                .arg(endpoint_arg())
+                .arg(handle_arg())
                 .arg(
                     arg!(<sig> "signal number, e.g. 15 (SIGTERM)")
                         .value_parser(clap::value_parser!(i32)),
@@ -308,26 +332,26 @@ fn cli() -> Command {
         .subcommand(client_args(
             Command::new("stop")
                 .about("client: stop a process and disable its restart policy")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))),
+                .arg(endpoint_arg())
+                .arg(handle_arg()),
         ))
         .subcommand(client_args(
             Command::new("stdin")
                 .about("client: pipe this command's stdin to a process")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))),
+                .arg(endpoint_arg())
+                .arg(handle_arg()),
         ))
         .subcommand(client_args(
             Command::new("subscribe")
                 .about("client: stream a process's stdout until it exits")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))),
+                .arg(endpoint_arg())
+                .arg(handle_arg()),
         ))
         .subcommand(client_args(
             Command::new("forget")
                 .about("client: drop a finished process's record from a supervisor")
-                .arg(arg!(<endpoint> "EndpointId of the supervisor to dial").value_parser(clap::value_parser!(EndpointId)))
-                .arg(arg!(<handle> "process handle").value_parser(clap::value_parser!(u64))),
+                .arg(endpoint_arg())
+                .arg(handle_arg()),
         ))
         .subcommand(client_args(
             Command::new("watch")
@@ -405,12 +429,7 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            // On WAN, seed bootstrap peers' relay addrs so gossip can reach them by id.
-            if let Some(r) = &relay {
-                for id in &bootstrap {
-                    book.add_endpoint_info(EndpointAddr::new(*id).with_relay_url(r.clone()));
-                }
-            }
+            seed_relay_addrs(&book, &relay, &bootstrap);
             let id = endpoint.id();
 
             let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -485,8 +504,7 @@ async fn main() -> Result<()> {
             let resp = client_call(sub, proto::Request::Spawn(spec)).await?;
             match resp {
                 proto::Response::Spawned { id, pid } => info!(handle = id, pid, "spawned"),
-                proto::Response::Error(e) => error!("spawn failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("spawn", other),
             }
 
             Ok(())
@@ -502,8 +520,7 @@ async fn main() -> Result<()> {
                         info!(handle = p.handle, pid = p.pid, state = ?p.state, mem = %mem_str(p.usage), restarts = p.restarts, "process");
                     }
                 }
-                proto::Response::Error(e) => error!("list failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("list", other),
             }
 
             Ok(())
@@ -517,8 +534,7 @@ async fn main() -> Result<()> {
                 proto::Response::Status(info) => {
                     info!(handle = info.handle, pid = info.pid, state = ?info.state, mem = %mem_str(info.usage), restarts = info.restarts, "status")
                 }
-                proto::Response::Error(e) => error!("query failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("query", other),
             }
 
             Ok(())
@@ -531,8 +547,7 @@ async fn main() -> Result<()> {
 
             match client_call(sub, proto::Request::Signal { id, sig }).await? {
                 proto::Response::Ack => info!(handle = id, sig, "signal delivered"),
-                proto::Response::Error(e) => error!("signal failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("signal", other),
             }
 
             Ok(())
@@ -544,8 +559,7 @@ async fn main() -> Result<()> {
 
             match client_call(sub, proto::Request::Stop { id }).await? {
                 proto::Response::Ack => info!(handle = id, "stopped"),
-                proto::Response::Error(e) => error!("stop failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("stop", other),
             }
 
             Ok(())
@@ -593,8 +607,7 @@ async fn main() -> Result<()> {
 
             match client_call(sub, proto::Request::Forget { id }).await? {
                 proto::Response::Ack => info!(handle = id, "forgotten"),
-                proto::Response::Error(e) => error!("forget failed: {e:?}"),
-                other => warn!("unexpected response: {other:?}"),
+                other => report_failure("forget", other),
             }
 
             Ok(())
@@ -613,12 +626,7 @@ async fn main() -> Result<()> {
             let (endpoint, book) =
                 endpoint::build_endpoint(vec![iroh_gossip::ALPN.to_vec()], None, relay.clone())
                     .await?;
-            // On WAN, gossip reaches bootstrap peers by id only if we know their relay addr.
-            if let Some(r) = &relay {
-                for id in &bootstrap {
-                    book.add_endpoint_info(EndpointAddr::new(*id).with_relay_url(r.clone()));
-                }
-            }
+            seed_relay_addrs(&book, &relay, &bootstrap);
             let gossip = Gossip::builder().spawn(endpoint.clone());
             let router = Router::builder(endpoint)
                 .accept(iroh_gossip::ALPN, gossip.clone())
