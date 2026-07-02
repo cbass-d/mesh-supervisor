@@ -43,7 +43,7 @@ impl ClientConfig {
         if let Some(secs) = matches.get_one::<u64>("read-timeout") {
             self.read_timeout = Duration::from_secs(*secs);
         }
-        if let Some(n) = matches.get_one::<u32>("max-retries") {
+        if let Some(n) = matches.get_one::<u32>("connect-retries") {
             self.max_retries = *n;
         }
         if let Some(ms) = matches.get_one::<u64>("retry-base-delay-ms") {

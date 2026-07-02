@@ -43,7 +43,9 @@ fn client_args(cmd: Command) -> Command {
             .required(false),
     )
     .arg(
-        arg!(--"max-retries" <n> "max connection retries")
+        // Named --connect-retries (not --max-retries) so it can't collide with
+        // spawn's restart-cap flag of that name; the env var keeps its old name.
+        arg!(--"connect-retries" <n> "max connection retries")
             .value_parser(clap::value_parser!(u32))
             .env("P2P_CLIENT_MAX_RETRIES")
             .required(false),
