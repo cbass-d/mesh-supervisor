@@ -14,6 +14,17 @@ that dial a supervisor by its `EndpointId` and issue control requests, or as
 | **Control** | acked RPC over ALPN `/supervisor/control/1` | one request → one response; reliable |
 | **Telemetry** | gossip over `iroh-gossip` on a shared topic | fire-and-forget; lossy, never blocks a workload |
 
+## Install
+
+Pre-built binaries for Linux x86_64 and macOS (x86_64 / Apple Silicon) are attached to each [GitHub Release](https://github.com/cbass-d/mesh-supervisor/releases).
+
+```sh
+# One-line installer
+curl -fsSL https://raw.githubusercontent.com/cbass-d/mesh-supervisor/master/scripts/install.sh | sh
+```
+
+Or download the matching `mesh-supervisor-<target>` binary from the latest release, make it executable, and place it on your `PATH`.
+
 ## Build & test
 
 ```sh
