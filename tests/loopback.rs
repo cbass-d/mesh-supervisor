@@ -7,6 +7,7 @@ use iroh::{
 };
 use mesh_supervisor::{
     client,
+    config::{ClientConfig, SupervisorConfig},
     process::ProcessManager,
     proto::{CONTROL_ALPN, ControlError, ProcInfo, ProcState, Request, Response, Spec},
     supervisor::{Authz, Supervisor},
@@ -34,13 +35,21 @@ async fn test_endpoint_static(alpns: Vec<Vec<u8>>, book: MemoryLookup) -> Endpoi
         .expect("bind failed")
 }
 
+fn client_cfg() -> ClientConfig {
+    ClientConfig::default()
+}
+
+fn supervisor_cfg() -> SupervisorConfig {
+    SupervisorConfig::default()
+}
+
 #[tokio::test]
 async fn spawn_then_list_over_loopback() {
     let server = test_endpoint(vec![CONTROL_ALPN.to_vec()]).await;
     let router = Router::builder(server.clone())
         .accept(
             CONTROL_ALPN,
-            Supervisor::new(ProcessManager::new(), Authz::open()),
+            Supervisor::new(ProcessManager::new(), Authz::open(), supervisor_cfg()),
         )
         .spawn();
 
@@ -49,7 +58,7 @@ async fn spawn_then_list_over_loopback() {
     let cl = test_endpoint(vec![]).await;
 
     // Empty to start.
-    let resp = client::request(&cl, addr.clone(), Request::List)
+    let resp = client::request(&cl, addr.clone(), Request::List, &client_cfg())
         .await
         .expect("list failed");
     assert_eq!(resp, Response::List(vec![]));
@@ -60,7 +69,7 @@ async fn spawn_then_list_over_loopback() {
         args: vec!["30".into()],
         ..Default::default()
     });
-    let id = match client::request(&cl, addr.clone(), req)
+    let id = match client::request(&cl, addr.clone(), req, &client_cfg())
         .await
         .expect("spawn failed")
     {
@@ -72,7 +81,7 @@ async fn spawn_then_list_over_loopback() {
     };
 
     // Now the supervisor tracks it, with state.
-    let resp = client::request(&cl, addr.clone(), Request::List)
+    let resp = client::request(&cl, addr.clone(), Request::List, &client_cfg())
         .await
         .expect("list failed");
     match resp {
@@ -85,7 +94,7 @@ async fn spawn_then_list_over_loopback() {
     }
 
     // Query: running.
-    let resp = client::request(&cl, addr.clone(), Request::Query { id })
+    let resp = client::request(&cl, addr.clone(), Request::Query { id }, &client_cfg())
         .await
         .expect("query failed");
     assert!(matches!(
@@ -99,14 +108,14 @@ async fn spawn_then_list_over_loopback() {
     // Stdin: stream a small frame (sleep ignores it, but the pipe accepts the bytes).
     let data = b"hi\n";
     let mut input = std::io::Cursor::new(&data[..]);
-    client::stdin_stream(&cl, addr.clone(), id, &mut input)
+    client::stdin_stream(&cl, addr.clone(), id, &mut input, &client_cfg())
         .await
         .expect("stdin");
 
     // Signal SIGTERM, then poll until the reaper records the exit.
     let req = Request::Signal { id, sig: 15 };
     assert_eq!(
-        client::request(&cl, addr.clone(), req)
+        client::request(&cl, addr.clone(), req, &client_cfg())
             .await
             .expect("signal"),
         Response::Ack
@@ -114,7 +123,7 @@ async fn spawn_then_list_over_loopback() {
 
     let mut exited = false;
     for _ in 0..50 {
-        let resp = client::request(&cl, addr.clone(), Request::Query { id })
+        let resp = client::request(&cl, addr.clone(), Request::Query { id }, &client_cfg())
             .await
             .expect("query failed");
         if matches!(
@@ -146,12 +155,15 @@ async fn control_denied_when_not_on_allowlist() {
 
     let server = test_endpoint(vec![CONTROL_ALPN.to_vec()]).await;
     let router = Router::builder(server.clone())
-        .accept(CONTROL_ALPN, Supervisor::new(ProcessManager::new(), authz))
+        .accept(
+            CONTROL_ALPN,
+            Supervisor::new(ProcessManager::new(), authz, supervisor_cfg()),
+        )
         .spawn();
     let addr = server.addr();
     let cl = test_endpoint(vec![]).await;
 
-    let resp = client::request(&cl, addr, Request::List)
+    let resp = client::request(&cl, addr, Request::List, &client_cfg())
         .await
         .expect("request");
     assert!(matches!(resp, Response::Error(ControlError::Denied)));
@@ -171,12 +183,15 @@ async fn read_only_client_can_inspect_not_control() {
 
     let server = test_endpoint(vec![CONTROL_ALPN.to_vec()]).await;
     let router = Router::builder(server.clone())
-        .accept(CONTROL_ALPN, Supervisor::new(ProcessManager::new(), authz))
+        .accept(
+            CONTROL_ALPN,
+            Supervisor::new(ProcessManager::new(), authz, supervisor_cfg()),
+        )
         .spawn();
     let addr = server.addr();
 
     // A read-only op is allowed.
-    let resp = client::request(&cl, addr.clone(), Request::List)
+    let resp = client::request(&cl, addr.clone(), Request::List, &client_cfg())
         .await
         .expect("list");
     assert!(matches!(resp, Response::List(_)));
@@ -186,7 +201,9 @@ async fn read_only_client_can_inspect_not_control() {
         cmd: "true".into(),
         ..Default::default()
     });
-    let resp = client::request(&cl, addr, spawn).await.expect("spawn req");
+    let resp = client::request(&cl, addr, spawn, &client_cfg())
+        .await
+        .expect("spawn req");
     assert!(matches!(resp, Response::Error(ControlError::Denied)));
 
     cl.close().await;
@@ -211,7 +228,7 @@ async fn telemetry_tick_reaches_watcher_over_gossip() {
 
     // Supervisor side: gossip + one running process to report on.
     let sup_gossip = Gossip::builder().spawn(server.clone());
-    let supervisor = Supervisor::new(ProcessManager::new(), Authz::open());
+    let supervisor = Supervisor::new(ProcessManager::new(), Authz::open(), supervisor_cfg());
     let _sup_router = Router::builder(server.clone())
         .accept(iroh_gossip::ALPN, sup_gossip.clone())
         .spawn();
@@ -232,6 +249,7 @@ async fn telemetry_tick_reaches_watcher_over_gossip() {
         sup_topic,
         server.secret_key().clone(),
         supervisor.procs(),
+        supervisor_cfg().telemetry,
     ));
 
     // Watcher side: join the topic, bootstrapping off the supervisor.
@@ -277,7 +295,7 @@ async fn subscribe_streams_stdout_to_two_clients() {
     let router = Router::builder(server.clone())
         .accept(
             CONTROL_ALPN,
-            Supervisor::new(ProcessManager::new(), Authz::open()),
+            Supervisor::new(ProcessManager::new(), Authz::open(), supervisor_cfg()),
         )
         .spawn();
     let addr = server.addr();
@@ -289,7 +307,7 @@ async fn subscribe_streams_stdout_to_two_clients() {
         args: vec!["-c".into(), "sleep 0.4; printf 'hello\\nworld\\n'".into()],
         ..Default::default()
     });
-    let id = match client::request(&cl, addr.clone(), req)
+    let id = match client::request(&cl, addr.clone(), req, &client_cfg())
         .await
         .expect("spawn")
     {
@@ -300,9 +318,10 @@ async fn subscribe_streams_stdout_to_two_clients() {
     // Two concurrent subscribers; both should receive the full stdout.
     let mut buf_a = Vec::new();
     let mut buf_b = Vec::new();
+    let cfg = client_cfg();
     let (ra, rb) = tokio::join!(
-        client::subscribe(&cl, addr.clone(), id, &mut buf_a),
-        client::subscribe(&cl, addr.clone(), id, &mut buf_b),
+        client::subscribe(&cl, addr.clone(), id, &mut buf_a, &cfg),
+        client::subscribe(&cl, addr.clone(), id, &mut buf_b, &cfg),
     );
     ra.expect("subscribe a");
     rb.expect("subscribe b");
@@ -322,7 +341,7 @@ async fn stdin_stream_pipes_large_input() {
     let router = Router::builder(server.clone())
         .accept(
             CONTROL_ALPN,
-            Supervisor::new(ProcessManager::new(), Authz::open()),
+            Supervisor::new(ProcessManager::new(), Authz::open(), supervisor_cfg()),
         )
         .spawn();
     let addr = server.addr();
@@ -332,7 +351,7 @@ async fn stdin_stream_pipes_large_input() {
         cmd: "cat".into(),
         ..Default::default()
     });
-    let id = match client::request(&cl, addr.clone(), req)
+    let id = match client::request(&cl, addr.clone(), req, &client_cfg())
         .await
         .expect("spawn")
     {
@@ -344,10 +363,11 @@ async fn stdin_stream_pipes_large_input() {
     let input = vec![0xabu8; 128 * 1024];
     let mut input_cursor = Cursor::new(&input);
     let mut output = Vec::new();
+    let cfg = client_cfg();
 
     let (stream_res, sub_res) = tokio::join!(
-        client::stdin_stream(&cl, addr.clone(), id, &mut input_cursor),
-        client::subscribe(&cl, addr.clone(), id, &mut output),
+        client::stdin_stream(&cl, addr.clone(), id, &mut input_cursor, &cfg),
+        client::subscribe(&cl, addr.clone(), id, &mut output, &cfg),
     );
     stream_res.expect("stdin stream");
     sub_res.expect("subscribe");

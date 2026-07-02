@@ -1,6 +1,6 @@
 //! M7: process records and node identity survive a supervisor restart.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use mesh_supervisor::{
     process::{ProcessManager, Record},
@@ -45,7 +45,7 @@ async fn process_state_survives_restart() {
     let loaded = store.load().expect("store load failed");
     assert_eq!(loaded.next_handle, 1);
 
-    let pm = ProcessManager::with_store(store, loaded, None);
+    let pm = ProcessManager::with_store(store, loaded, None, Duration::from_secs(5));
 
     // The child is gone, so the record reloads as a stale tombstone (pid preserved).
     assert_eq!(pm.list(), vec![1]);

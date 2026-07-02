@@ -1,48 +1,34 @@
 //! Client side: dial a supervisor, send one request, return its response.
 
 use std::future::Future;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::config::ClientConfig;
 use crate::proto::{CONTROL_ALPN, Request, Response, read_msg, write_msg};
-
-/// Maximum connection attempts for a single client operation.
-const MAX_RETRIES: u32 = 5;
-/// Initial delay between retries.
-const BASE_DELAY: Duration = Duration::from_millis(100);
-/// Maximum delay between retries.
-const MAX_DELAY: Duration = Duration::from_secs(2);
-/// How long to wait for a response after a stream is open.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Retry `f` with exponential backoff until it succeeds or `max_retries` is
 /// exhausted. Only transient transport setup errors should be returned as `Err`;
 /// application-level failures should be returned as `Ok` and handled by callers.
-async fn with_retry<F, Fut, T>(
-    max_retries: u32,
-    base_delay: Duration,
-    max_delay: Duration,
-    mut f: F,
-) -> Result<T>
+async fn with_retry<F, Fut, T>(cfg: &ClientConfig, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let mut delay = base_delay;
-    for attempt in 1..=max_retries {
+    let mut delay = cfg.retry_base_delay;
+    for attempt in 1..=cfg.max_retries {
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if attempt == max_retries {
+                if attempt == cfg.max_retries {
                     return Err(e);
                 }
 
                 tracing::debug!(attempt, error = %e, "client transport setup failed, retrying");
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(max_delay);
+                delay = (delay * 2).min(cfg.retry_max_delay);
             }
         }
     }
@@ -59,9 +45,10 @@ pub async fn request(
     endpoint: &Endpoint,
     target: impl Into<EndpointAddr>,
     req: Request,
+    cfg: &ClientConfig,
 ) -> Result<Response> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(MAX_RETRIES, BASE_DELAY, MAX_DELAY, || async {
+    let (conn, mut send, mut recv) = with_retry(cfg, || async {
         let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
         let (send, recv) = conn.open_bi().await?;
         Ok((conn, send, recv))
@@ -69,7 +56,7 @@ pub async fn request(
     .await?;
 
     write_msg(&mut send, &req).await?;
-    let resp = tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+    let resp = tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
         .await
         .context("timed out waiting for response")??;
 
@@ -89,9 +76,10 @@ pub async fn subscribe(
     target: impl Into<EndpointAddr>,
     id: u64,
     out: &mut (impl AsyncWrite + Unpin),
+    cfg: &ClientConfig,
 ) -> Result<()> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(MAX_RETRIES, BASE_DELAY, MAX_DELAY, || async {
+    let (conn, mut send, mut recv) = with_retry(cfg, || async {
         let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
         let (send, recv) = conn.open_bi().await?;
         Ok((conn, send, recv))
@@ -99,7 +87,7 @@ pub async fn subscribe(
     .await?;
 
     write_msg(&mut send, &Request::Subscribe { id }).await?;
-    match tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+    match tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
         .await
         .context("timed out waiting for subscribe ack")??
     {
@@ -125,9 +113,10 @@ pub async fn stdin_stream(
     target: impl Into<EndpointAddr>,
     id: u64,
     input: &mut (impl AsyncRead + Unpin),
+    cfg: &ClientConfig,
 ) -> Result<()> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(MAX_RETRIES, BASE_DELAY, MAX_DELAY, || async {
+    let (conn, mut send, mut recv) = with_retry(cfg, || async {
         let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
         let (send, recv) = conn.open_bi().await?;
         Ok((conn, send, recv))
@@ -138,7 +127,7 @@ pub async fn stdin_stream(
     tokio::io::copy(input, &mut send).await?;
     send.finish()?;
 
-    match tokio::time::timeout(READ_TIMEOUT, read_msg::<Response>(&mut recv))
+    match tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
         .await
         .context("timed out waiting for stdin response")??
     {
@@ -156,29 +145,36 @@ pub async fn stdin_stream(
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
+
+    fn test_client_config() -> ClientConfig {
+        ClientConfig {
+            read_timeout: Duration::from_secs(30),
+            max_retries: 5,
+            retry_base_delay: Duration::from_millis(1),
+            retry_max_delay: Duration::from_millis(10),
+            telemetry: Default::default(),
+        }
+    }
 
     #[tokio::test]
     async fn retry_succeeds_after_failures() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
-        let result = with_retry(
-            5,
-            Duration::from_millis(1),
-            Duration::from_millis(10),
-            move || {
-                let attempts = attempts_clone.clone();
-                async move {
-                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                    if n < 3 {
-                        Err(anyhow::anyhow!("transient"))
-                    } else {
-                        Ok(42)
-                    }
+        let cfg = test_client_config();
+        let result = with_retry(&cfg, move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(anyhow::anyhow!("transient"))
+                } else {
+                    Ok(42)
                 }
-            },
-        )
+            }
+        })
         .await;
 
         assert_eq!(result.unwrap(), 42);
@@ -189,21 +185,17 @@ mod tests {
     async fn retry_gives_up_after_max_attempts() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
-        let result = with_retry(
-            3,
-            Duration::from_millis(1),
-            Duration::from_millis(10),
-            move || {
-                let attempts = attempts_clone.clone();
-                async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Err::<(), _>(anyhow::anyhow!("always fails"))
-                }
-            },
-        )
+        let cfg = test_client_config();
+        let result = with_retry(&cfg, move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("always fails"))
+            }
+        })
         .await;
 
         assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), cfg.max_retries as usize);
     }
 }

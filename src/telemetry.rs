@@ -14,6 +14,7 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::config::TelemetryConfig;
 use crate::process::ProcessManager;
 use crate::proto::{Handle, ProcInfo};
 
@@ -29,13 +30,6 @@ pub fn topic_for(secret: Option<&str>) -> TopicId {
 
     TopicId::from_bytes(*blake3::hash(label.as_bytes()).as_bytes())
 }
-
-/// Publish cadence. One snapshot per interval; ticks are lossy under load.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Reject ticks whose timestamp is more than this far from now (replay/staleness).
-/// Assumes publisher and watcher clocks are roughly in sync (e.g. NTP).
-const MAX_TICK_AGE_MS: u64 = 10_000;
 
 /// A telemetry tick's authenticated content: one supervisor's process table at a
 /// moment in time. `from`, `ts`, and `seq` are bound into the signed payload, so
@@ -59,15 +53,20 @@ fn now_millis() -> u64 {
 
 /// Whether a tick stamped `ts` is acceptably close to `now` (both ms): within the
 /// window in either direction, tolerating modest clock skew.
-fn fresh(ts: u64, now: u64) -> bool {
-    now.abs_diff(ts) <= MAX_TICK_AGE_MS
+fn fresh(ts: u64, now: u64, max_tick_age: Duration) -> bool {
+    now.abs_diff(ts) <= max_tick_age.as_millis() as u64
 }
 
 /// Decide whether to accept a decoded tick. Rejects stale timestamps and any
 /// sequence number that is not strictly greater than the last accepted tick from
 /// the same publisher. On acceptance, updates `latest_seq`.
-fn accept_tick(tick: &Tick, now: u64, latest_seq: &mut HashMap<EndpointId, u64>) -> bool {
-    if !fresh(tick.ts, now) {
+fn accept_tick(
+    tick: &Tick,
+    now: u64,
+    latest_seq: &mut HashMap<EndpointId, u64>,
+    max_tick_age: Duration,
+) -> bool {
+    if !fresh(tick.ts, now, max_tick_age) {
         return false;
     }
     if latest_seq
@@ -114,8 +113,13 @@ pub fn open_tick(content: &[u8]) -> Result<Tick> {
 
 /// Sample `procs` on an interval and broadcast each non-empty tick, signed by
 /// `secret`. Runs until the topic closes; errors are logged, never propagated.
-pub async fn publish_loop(mut topic: GossipTopic, secret: SecretKey, procs: ProcessManager) {
-    let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
+pub async fn publish_loop(
+    mut topic: GossipTopic,
+    secret: SecretKey,
+    procs: ProcessManager,
+    cfg: TelemetryConfig,
+) {
+    let mut interval = tokio::time::interval(cfg.sample_interval);
     let mut seq = 0u64;
 
     loop {
@@ -140,7 +144,7 @@ pub async fn publish_loop(mut topic: GossipTopic, secret: SecretKey, procs: Proc
 /// Print telemetry ticks from the topic until the stream ends. Drops ticks that
 /// fail signature verification, fall outside the freshness window, or replay an
 /// already-seen sequence number from the same publisher.
-pub async fn watch_loop(mut topic: GossipTopic) -> Result<()> {
+pub async fn watch_loop(mut topic: GossipTopic, max_tick_age: Duration) -> Result<()> {
     let mut latest_seq: HashMap<EndpointId, u64> = HashMap::new();
     // Last (cpu_usec, ts) per (publisher, handle) for computing a CPU rate.
     let mut prev: HashMap<(EndpointId, Handle), (u64, u64)> = HashMap::new();
@@ -149,7 +153,7 @@ pub async fn watch_loop(mut topic: GossipTopic) -> Result<()> {
         match event {
             Ok(Event::Received(msg)) => match open_tick(&msg.content) {
                 Ok(tick) => {
-                    if !accept_tick(&tick, now_millis(), &mut latest_seq) {
+                    if !accept_tick(&tick, now_millis(), &mut latest_seq, max_tick_age) {
                         warn!(from = %tick.from, ts = tick.ts, seq = tick.seq, "dropping stale/replayed tick");
                         continue;
                     }
@@ -199,6 +203,10 @@ pub async fn watch_loop(mut topic: GossipTopic) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_telemetry_cfg() -> TelemetryConfig {
+        TelemetryConfig::default()
+    }
+
     #[test]
     fn topic_secret_changes_and_is_stable() {
         assert_eq!(topic_for(Some("hunter2")), topic_for(Some("hunter2")));
@@ -208,12 +216,14 @@ mod tests {
 
     #[test]
     fn fresh_window_rejects_old_and_far_future() {
+        let cfg = test_telemetry_cfg();
         let now = 1_000_000;
-        assert!(fresh(now, now));
-        assert!(fresh(now - MAX_TICK_AGE_MS, now)); // within window (past)
-        assert!(fresh(now + MAX_TICK_AGE_MS, now)); // within window (skew ahead)
-        assert!(!fresh(now - MAX_TICK_AGE_MS - 1, now)); // too old → replay
-        assert!(!fresh(now + MAX_TICK_AGE_MS + 1, now)); // too far ahead
+        let max_ms = cfg.max_tick_age.as_millis() as u64;
+        assert!(fresh(now, now, cfg.max_tick_age));
+        assert!(fresh(now - max_ms, now, cfg.max_tick_age)); // within window (past)
+        assert!(fresh(now + max_ms, now, cfg.max_tick_age)); // within window (skew ahead)
+        assert!(!fresh(now - max_ms - 1, now, cfg.max_tick_age)); // too old → replay
+        assert!(!fresh(now + max_ms + 1, now, cfg.max_tick_age)); // too far ahead
     }
 
     #[test]
@@ -253,6 +263,7 @@ mod tests {
 
     #[test]
     fn accept_tick_rejects_replay_and_reordering() {
+        let cfg = test_telemetry_cfg();
         let id = SecretKey::generate().public();
         let now = 1_000_000;
         let mut latest = HashMap::new();
@@ -264,17 +275,24 @@ mod tests {
             stats: vec![],
         };
 
-        assert!(accept_tick(&tick(1), now, &mut latest));
+        assert!(accept_tick(&tick(1), now, &mut latest, cfg.max_tick_age));
         // Same or lower sequence number is a replay.
-        assert!(!accept_tick(&tick(1), now, &mut latest), "duplicate seq");
-        assert!(!accept_tick(&tick(0), now, &mut latest), "regressed seq");
+        assert!(
+            !accept_tick(&tick(1), now, &mut latest, cfg.max_tick_age),
+            "duplicate seq"
+        );
+        assert!(
+            !accept_tick(&tick(0), now, &mut latest, cfg.max_tick_age),
+            "regressed seq"
+        );
         // Higher sequence number is accepted.
-        assert!(accept_tick(&tick(2), now, &mut latest));
+        assert!(accept_tick(&tick(2), now, &mut latest, cfg.max_tick_age));
         // Stale timestamp is still rejected even with a fresh sequence number.
         assert!(!accept_tick(
             &tick(3),
-            now + MAX_TICK_AGE_MS + 1,
-            &mut latest
+            now + cfg.max_tick_age.as_millis() as u64 + 1,
+            &mut latest,
+            cfg.max_tick_age
         ));
     }
 }

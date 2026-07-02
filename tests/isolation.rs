@@ -1,7 +1,10 @@
 //! M8: per-child cgroup v2 memory cap + teardown. Skipped where cgroup delegation
 //! is unavailable (non-Linux, no systemd user subtree), so it stays portable.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use mesh_supervisor::{
     cgroup::Cgroups,
@@ -33,7 +36,7 @@ async fn child_is_capped_and_torn_down() {
     let _ = std::fs::remove_file(&path);
     let store = Store::open(&path).expect("store");
     let loaded = store.load().expect("load");
-    let pm = ProcessManager::with_store(store, loaded, Some(cgroups));
+    let pm = ProcessManager::with_store(store, loaded, Some(cgroups), Duration::from_secs(5));
 
     let cap = 64 * 1024 * 1024;
     let (handle, pid) = pm

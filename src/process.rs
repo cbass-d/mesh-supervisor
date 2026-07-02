@@ -42,9 +42,6 @@ const RESTART_BASE: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(30);
 const STABLE_RESET: Duration = Duration::from_secs(10);
 
-/// Grace period after a `stop`/shutdown SIGTERM before escalating to SIGKILL.
-const STOP_DEADLINE: Duration = Duration::from_secs(5);
-
 /// Write the calling process's pid into an open `cgroup.procs`, joining that leaf.
 /// Runs in the child after fork, before exec, so it must stay async-signal-safe
 /// (see `CommandExt::pre_exec` Safety docs): `write!` of an integer to a raw file
@@ -266,10 +263,10 @@ impl ProcEntry {
 }
 
 /// Cheap-to-clone handle to the shared process table.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ProcessManager(Arc<Inner>);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     procs: Mutex<HashMap<Handle, ProcEntry>>,
     next: AtomicU64,
@@ -279,6 +276,27 @@ struct Inner {
     cgroups: Option<Cgroups>,
     /// Set on shutdown so supervisor tasks stop relaunching during teardown.
     shutdown: AtomicBool,
+    /// Grace period after SIGTERM before escalating to SIGKILL.
+    stop_deadline: Duration,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            procs: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+            store: None,
+            cgroups: None,
+            shutdown: AtomicBool::new(false),
+            stop_deadline: Duration::from_secs(5),
+        }
+    }
+}
+
+impl Default for ProcessManager {
+    fn default() -> Self {
+        Self(Arc::new(Inner::default()))
+    }
 }
 
 impl ProcessManager {
@@ -286,8 +304,21 @@ impl ProcessManager {
         Self::default()
     }
 
+    /// Use a non-default grace period for SIGTERM → SIGKILL escalation.
+    pub fn with_stop_deadline(stop_deadline: Duration) -> Self {
+        Self(Arc::new(Inner {
+            stop_deadline,
+            ..Inner::default()
+        }))
+    }
+
     /// Build from a store: reload tombstoned records and continue the handle counter.
-    pub fn with_store(store: Store, loaded: Loaded, cgroups: Option<Cgroups>) -> Self {
+    pub fn with_store(
+        store: Store,
+        loaded: Loaded,
+        cgroups: Option<Cgroups>,
+        stop_deadline: Duration,
+    ) -> Self {
         let map = loaded
             .records
             .iter()
@@ -300,6 +331,7 @@ impl ProcessManager {
             store: Some(store),
             cgroups,
             shutdown: AtomicBool::new(false),
+            stop_deadline,
         }))
     }
 
@@ -586,8 +618,8 @@ impl ProcessManager {
     }
 
     /// Stop a process and disarm its restart policy (so this intentional stop, unlike
-    /// a crash, isn't relaunched). SIGTERMs it now and, if it's still up after
-    /// `STOP_DEADLINE`, escalates to SIGKILL. A no-op if it isn't running.
+    /// a crash, isn't relaunched). SIGTERMs it now and, if it's still up after the
+    /// configured stop deadline, escalates to SIGKILL. A no-op if it isn't running.
     pub fn stop(&self, id: Handle) -> Result<(), ControlError> {
         let pid = {
             let mut map = self.0.procs.lock();
@@ -604,12 +636,13 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// SIGTERM a child, then SIGKILL it if it's still running after `STOP_DEADLINE`.
-    /// The escalation targets the cgroup (or process group) rather than the bare pid,
-    /// so it can't land on a reused pid.
+    /// SIGTERM a child, then SIGKILL it if it's still running after the configured
+    /// stop deadline. The escalation targets the cgroup (or process group) rather
+    /// than the bare pid, so it can't land on a reused pid.
     async fn terminate(self, id: Handle, pid: u32) {
+        let deadline = self.0.stop_deadline;
         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-        tokio::time::sleep(STOP_DEADLINE).await;
+        tokio::time::sleep(deadline).await;
 
         let alive = self
             .0
@@ -722,9 +755,9 @@ impl ProcessManager {
     }
 
     /// Graceful supervisor shutdown: stop relaunching, SIGTERM every child, wait for
-    /// them to exit (returning early once all do, capped at `STOP_DEADLINE`), then
-    /// force any survivors down — `cgroup.kill` where available, else SIGKILL each
-    /// process group.
+    /// them to exit (returning early once all do, capped at the configured stop
+    /// deadline), then force any survivors down — `cgroup.kill` where available, else
+    /// SIGKILL each process group.
     pub async fn kill_all(&self) {
         self.0.shutdown.store(true, Ordering::Relaxed); // stop supervisors relaunching
 
@@ -734,7 +767,7 @@ impl ProcessManager {
         }
 
         // Give children a grace period to exit, but return as soon as they all have.
-        let deadline = Instant::now() + STOP_DEADLINE;
+        let deadline = Instant::now() + self.0.stop_deadline;
         while Instant::now() < deadline && self.any_running() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

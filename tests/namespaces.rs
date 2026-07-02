@@ -2,7 +2,7 @@
 //! Skipped where unprivileged user namespaces are unavailable (some hardened
 //! kernels), so it stays portable. Uses `ProcessManager` directly (no endpoint).
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use mesh_supervisor::{process::ProcessManager, proto::Spec, store::Store};
 
@@ -69,7 +69,7 @@ async fn isolated_child_cannot_read_the_store() {
 
     let store = Store::open(&store_path).expect("store");
     let loaded = store.load().expect("load");
-    let pm = ProcessManager::with_store(store, loaded, None);
+    let pm = ProcessManager::with_store(store, loaded, None, Duration::from_secs(5));
 
     let script = format!(
         "sleep 0.2; cat {} 2>/dev/null; echo DONE:$?",

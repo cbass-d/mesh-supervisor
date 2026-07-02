@@ -13,21 +13,9 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
+use crate::config::{RateLimiterConfig, SupervisorConfig};
 use crate::process::ProcessManager;
 use crate::proto::{ControlError, Request, Response, read_msg, write_msg};
-
-/// Per-peer token bucket: sustained `REFILL`/s with a burst of `BURST`.
-const BURST: f64 = 20.0;
-const REFILL: f64 = 10.0;
-
-/// Absolute upper bound on the number of per-peer buckets. Prevents unbounded
-/// memory growth when a single host churns through many `EndpointId`s.
-const MAX_BUCKETS: usize = 2048;
-/// Idle time after which a peer's bucket can be reclaimed.
-const EVICTION_TTL: Duration = Duration::from_secs(90);
-/// How long the supervisor waits for a client to send a request after opening a
-/// bidi stream. Prevents slowloris-style hangs.
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One token-bucket entry.
 #[derive(Debug)]
@@ -38,28 +26,37 @@ struct Bucket {
 
 /// Per-peer request rate limiter (token bucket keyed by `EndpointId`). Each request
 /// is its own connection, so limiting must be per-peer, not per-connection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RateLimiter {
+    cfg: RateLimiterConfig,
     buckets: Mutex<HashMap<EndpointId, Bucket>>,
 }
 
 impl RateLimiter {
+    fn new(cfg: RateLimiterConfig) -> Self {
+        Self {
+            cfg,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Consume one token for `peer`; `false` if it's currently rate-limited.
     fn allow(&self, peer: EndpointId) -> bool {
         let now = Instant::now();
+        let cfg = &self.cfg;
 
         // Fast path: update the bucket and decide under a short critical section.
         // We return whether the map is over capacity so cleanup can run afterwards
-        // without holding the lock during the O(MAX_BUCKETS) eviction scan.
+        // without holding the lock during the O(max_buckets) eviction scan.
         let (allowed, over_cap) = {
             let mut buckets = self.buckets.lock();
             let bucket = buckets.entry(peer).or_insert_with(|| Bucket {
-                tokens: BURST,
+                tokens: cfg.burst,
                 last_used: now,
             });
             bucket.tokens = (bucket.tokens
-                + now.duration_since(bucket.last_used).as_secs_f64() * REFILL)
-                .min(BURST);
+                + now.duration_since(bucket.last_used).as_secs_f64() * cfg.refill)
+                .min(cfg.burst);
 
             bucket.last_used = now;
             let allowed = if bucket.tokens >= 1.0 {
@@ -69,23 +66,23 @@ impl RateLimiter {
                 false
             };
 
-            (allowed, buckets.len() > MAX_BUCKETS)
+            (allowed, buckets.len() > cfg.max_buckets)
         };
 
         // Slow path: eviction is best-effort cleanup, so it runs under a separate
         // lock acquisition and cannot delay other rate-limit decisions.
         if over_cap {
             let mut buckets = self.buckets.lock();
-            if buckets.len() > MAX_BUCKETS {
+            if buckets.len() > cfg.max_buckets {
                 Self::evict_lru(&mut buckets, now);
             }
-            Self::evict_stale(&mut buckets, now);
+            Self::evict_stale(&mut buckets, now, cfg.eviction_ttl);
         }
 
         allowed
     }
 
-    /// Remove the least-recently-used bucket. `O(MAX_BUCKETS)`; the cap keeps it small.
+    /// Remove the least-recently-used bucket. `O(max_buckets)`; the cap keeps it small.
     fn evict_lru(buckets: &mut HashMap<EndpointId, Bucket>, _now: Instant) -> Option<EndpointId> {
         let oldest = buckets
             .iter()
@@ -99,9 +96,13 @@ impl RateLimiter {
         oldest
     }
 
-    /// Remove buckets that haven't been used since `now - EVICTION_TTL`.
-    fn evict_stale(buckets: &mut HashMap<EndpointId, Bucket>, now: Instant) {
-        let cutoff = now - EVICTION_TTL;
+    /// Remove buckets that haven't been used since `now - eviction_ttl`.
+    fn evict_stale(
+        buckets: &mut HashMap<EndpointId, Bucket>,
+        now: Instant,
+        eviction_ttl: Duration,
+    ) {
+        let cutoff = now - eviction_ttl;
         buckets.retain(|_, b| b.last_used >= cutoff);
     }
 }
@@ -126,11 +127,12 @@ impl Authz {
 }
 
 /// Supervisor state: the process table shared across all control connections.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Supervisor {
     procs: ProcessManager,
     authz: Arc<Authz>,
     limiter: Arc<RateLimiter>,
+    cfg: SupervisorConfig,
 }
 
 impl ProtocolHandler for Supervisor {
@@ -143,7 +145,9 @@ impl ProtocolHandler for Supervisor {
             warn!(%remote, "connection rate limited");
             Err(ControlError::RateLimited)
         } else {
-            match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_msg::<Request>(&mut recv)).await {
+            match tokio::time::timeout(self.cfg.request_timeout, read_msg::<Request>(&mut recv))
+                .await
+            {
                 Ok(Ok(req)) => self.authorize(remote, &req).map(|()| req),
                 // Don't reflect the parser's detail back to the client; log it instead.
                 Ok(Err(e)) => {
@@ -202,12 +206,14 @@ impl ProtocolHandler for Supervisor {
 }
 
 impl Supervisor {
-    /// Build a supervisor around a process table and an authorization policy.
-    pub fn new(procs: ProcessManager, authz: Authz) -> Self {
+    /// Build a supervisor around a process table, an authorization policy, and
+    /// operational configuration.
+    pub fn new(procs: ProcessManager, authz: Authz, cfg: SupervisorConfig) -> Self {
         Self {
             procs,
             authz: Arc::new(authz),
-            limiter: Arc::default(),
+            limiter: Arc::new(RateLimiter::new(cfg.rate_limiter.clone())),
+            cfg,
         }
     }
 
@@ -305,13 +311,18 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
 
+    fn test_rate_cfg() -> RateLimiterConfig {
+        RateLimiterConfig::default()
+    }
+
     #[test]
     fn rate_limiter_allows_burst_then_blocks() {
-        let limiter = RateLimiter::default();
+        let cfg = test_rate_cfg();
+        let limiter = RateLimiter::new(cfg.clone());
         let peer = SecretKey::generate().public();
 
         // A full burst is admitted back-to-back (refill over microseconds is ~0)...
-        for _ in 0..BURST as u32 {
+        for _ in 0..cfg.burst as u32 {
             assert!(limiter.allow(peer));
         }
         // ...then the bucket is empty.
@@ -323,8 +334,9 @@ mod tests {
 
     #[test]
     fn rate_limiter_evicts_lru_when_full() {
-        let limiter = RateLimiter::default();
-        let peers: Vec<_> = (0..MAX_BUCKETS + 1)
+        let cfg = test_rate_cfg();
+        let limiter = RateLimiter::new(cfg.clone());
+        let peers: Vec<_> = (0..cfg.max_buckets + 1)
             .map(|_| SecretKey::generate().public())
             .collect();
 
@@ -336,7 +348,7 @@ mod tests {
 
         assert_eq!(
             limiter.buckets.lock().len(),
-            MAX_BUCKETS,
+            cfg.max_buckets,
             "bucket count should be capped"
         );
 
@@ -348,11 +360,12 @@ mod tests {
 
         // Re-allowing the evicted peer creates a new bucket; count stays capped.
         assert!(limiter.allow(peers[0]));
-        assert_eq!(limiter.buckets.lock().len(), MAX_BUCKETS);
+        assert_eq!(limiter.buckets.lock().len(), cfg.max_buckets);
     }
 
     #[test]
     fn evict_stale_removes_idle_peers() {
+        let cfg = test_rate_cfg();
         let now = Instant::now();
         let old = SecretKey::generate().public();
         let recent = SecretKey::generate().public();
@@ -361,7 +374,7 @@ mod tests {
             old,
             Bucket {
                 tokens: 0.0,
-                last_used: now - EVICTION_TTL - Duration::from_secs(1),
+                last_used: now - cfg.eviction_ttl - Duration::from_secs(1),
             },
         );
         buckets.insert(
@@ -372,7 +385,7 @@ mod tests {
             },
         );
 
-        RateLimiter::evict_stale(&mut buckets, now);
+        RateLimiter::evict_stale(&mut buckets, now, cfg.eviction_ttl);
 
         assert!(!buckets.contains_key(&old));
         assert!(buckets.contains_key(&recent));
