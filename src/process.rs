@@ -369,7 +369,12 @@ impl ProcessManager {
             );
             tokio::time::sleep(delay).await;
 
-            if self.0.shutdown.load(Ordering::Relaxed) {
+            // A stop() (disarm) or forget() (remove) landing in the backoff
+            // window means the operator dropped this process; honor that rather
+            // than relaunching a child they believe is gone. Re-read under the
+            // lock, since the pre-sleep `armed` check is now stale.
+            let armed = self.0.procs.lock().get(&id).is_some_and(|e| e.armed);
+            if self.0.shutdown.load(Ordering::Relaxed) || !armed {
                 break;
             }
 
@@ -492,6 +497,7 @@ impl ProcessManager {
         let pid = {
             let map = self.0.procs.lock();
             let entry = map.get(&id).ok_or(ControlError::NotFound(id))?;
+
             // Never signal a non-running entry: its pid may have been reused.
             if !matches!(entry.status, ProcState::Running) {
                 return Err(ControlError::BadRequest("process is not running".into()));
@@ -584,7 +590,18 @@ impl ProcessManager {
     pub async fn kill_all(&self) {
         self.0.shutdown.store(true, Ordering::Relaxed); // stop supervisors relaunching
 
-        let pids: Vec<i32> = self.0.procs.lock().values().map(|e| e.pid as i32).collect();
+        // Only signal live children. A stale/exited entry holds a pid from a prior
+        // supervisor (or a reload tombstone) that may have been reused — and the
+        // `-pid` process-group SIGKILL below would turn a placeholder like pid 1
+        // into kill(-1, …), hitting every process we own. Mirror signal()'s guard.
+        let pids: Vec<i32> = self
+            .0
+            .procs
+            .lock()
+            .values()
+            .filter(|e| matches!(e.status, ProcState::Running))
+            .map(|e| e.pid as i32)
+            .collect();
         for pid in &pids {
             let _ = kill(Pid::from_raw(*pid), Signal::SIGTERM);
         }

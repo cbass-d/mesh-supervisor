@@ -20,12 +20,15 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    // Always make at least one attempt: `max_retries` of 0 is accepted CLI/env
+    // input, and `1..=0` would be empty and fall through to `unreachable!()`.
+    let attempts = cfg.max_retries.max(1);
     let mut delay = cfg.retry_base_delay;
-    for attempt in 1..=cfg.max_retries {
+    for attempt in 1..=attempts {
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if attempt == cfg.max_retries {
+                if attempt == attempts {
                     return Err(e);
                 }
 
@@ -200,5 +203,28 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), cfg.max_retries as usize);
+    }
+
+    #[tokio::test]
+    async fn retry_with_zero_max_retries_makes_one_attempt() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let mut cfg = test_client_config();
+        cfg.max_retries = 0; // accepted CLI/env value; must not reach unreachable!()
+        let result = with_retry(&cfg, move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("always fails"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "max_retries=0 must make exactly one attempt, not panic"
+        );
     }
 }

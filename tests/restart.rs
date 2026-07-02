@@ -91,6 +91,43 @@ async fn stop_disarms_restart() {
 }
 
 #[tokio::test]
+async fn stop_during_backoff_does_not_relaunch() {
+    let pm = ProcessManager::new();
+
+    // `false` exits 1 immediately; under Always it enters the ~1s restart backoff.
+    let (id, _) = pm
+        .spawn(spec("false", RestartPolicy::Always, 0))
+        .expect("spawn");
+
+    // Catch it in the backoff window (Exited, awaiting relaunch) before the first
+    // ~1s backoff elapses; `false` exits in milliseconds so this lands immediately.
+    let mut in_backoff = false;
+    for _ in 0..40 {
+        if matches!(pm.query(id).unwrap().state, ProcState::Exited(_)) {
+            in_backoff = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(in_backoff, "child never reached the backoff window");
+
+    // A stop() landing in that window must be honored: the child must not come
+    // back after the backoff (previously supervise re-checked only `shutdown`).
+    pm.stop(id).expect("stop");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let info = pm.query(id).unwrap();
+    assert_eq!(
+        info.restarts, 0,
+        "a stop() during the restart-backoff window must prevent relaunch"
+    );
+    assert!(matches!(info.state, ProcState::Exited(_)));
+
+    pm.kill_all().await;
+}
+
+#[tokio::test]
 async fn stop_escalates_to_sigkill() {
     let pm = ProcessManager::new();
 

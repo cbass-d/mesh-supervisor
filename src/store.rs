@@ -75,7 +75,7 @@ impl Store {
         Ok(key)
     }
 
-    /// All persisted records and the next-handle counter (max key + 1 if unset).
+    /// All persisted records and the next-handle counter.
     pub fn load(&self) -> Result<Loaded> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RECORDS)?;
@@ -88,10 +88,16 @@ impl Store {
         }
         records.sort_by_key(|(h, _)| *h);
 
-        let next_handle = match self.get_meta(KEY_NEXT)? {
+        // `next_handle` must exceed every persisted key so a fresh spawn can never
+        // reuse a live handle. `put` advances KEY_NEXT to the handle it writes, so a
+        // relaunch of a non-maximum handle can regress it below the highest record;
+        // guard against that by taking the max with the highest key on disk.
+        let max_key = records.iter().map(|(h, _)| *h).max().unwrap_or(0);
+        let stored = match self.get_meta(KEY_NEXT)? {
             Some(b) => u64::from_le_bytes(b.as_slice().try_into().context("bad counter")?),
-            None => records.iter().map(|(h, _)| *h).max().unwrap_or(0),
+            None => 0,
         };
+        let next_handle = stored.max(max_key);
 
         Ok(Loaded {
             records,

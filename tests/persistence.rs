@@ -72,6 +72,56 @@ async fn process_state_survives_restart() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[tokio::test]
+async fn relaunch_does_not_regress_handle_counter() {
+    let path = temp_store_path();
+    let _ = std::fs::remove_file(&path);
+
+    // Spawn handles 1 and 2, then persist handle 1 again as a relaunch would.
+    // `put` advances KEY_NEXT to the handle it writes, so this regresses the
+    // counter to 1 while record 2 is still on disk.
+    {
+        let store = Store::open(&path).expect("store open failed");
+        let rec = |cmd: &str| Record {
+            cmd: cmd.into(),
+            args: vec![],
+            env: vec![],
+            pid: 1,
+            status: ProcState::Running,
+        };
+        store.put(1, &rec("a")).expect("put 1");
+        store.put(2, &rec("b")).expect("put 2");
+        store.put(1, &rec("a")).expect("relaunch put 1");
+    }
+
+    // On reload the counter must still clear the highest live handle, so the next
+    // spawn cannot collide with the existing record 2.
+    let store = Store::open(&path).expect("store reopen failed");
+    let loaded = store.load().expect("store load failed");
+    assert!(
+        loaded.next_handle >= 2,
+        "next_handle {} would reuse a live handle",
+        loaded.next_handle
+    );
+
+    let pm = ProcessManager::with_store(store, loaded, None, Duration::from_secs(5));
+    let (new_handle, _) = pm
+        .spawn(Spec {
+            cmd: "true".into(),
+            ..Default::default()
+        })
+        .expect("spawn");
+    assert!(
+        new_handle > 2,
+        "fresh spawn handle {new_handle} collided with an existing handle"
+    );
+
+    // No kill_all here: the only real child is `true` (Never policy), which has
+    // already exited and left nothing to reap. The reloaded records carry a
+    // placeholder pid, so signalling them would be both pointless and unsafe.
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn identity_survives_restart() {
     let path = temp_store_path();

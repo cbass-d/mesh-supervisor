@@ -16,6 +16,7 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+
     let matches = cli::cli().get_matches();
 
     match matches.subcommand() {
