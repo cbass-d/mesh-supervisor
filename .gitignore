@@ -1,7 +1,6 @@
 /target
 mesh-supervisor.redb
 
-# Ignore all Markdown files except README.md and AGENTS.md
+# Ignore all Markdown files except README.md
 *.md
 !README.md
-!AGENTS.md
