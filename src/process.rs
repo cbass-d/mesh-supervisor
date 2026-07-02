@@ -2,8 +2,6 @@
 
 use std::{
     collections::HashMap,
-    ffi::{CStr, CString},
-    os::unix::ffi::OsStringExt,
     process::Stdio,
     sync::{
         Arc,
@@ -28,6 +26,7 @@ use tracing::{info, warn};
 
 use crate::cgroup::Cgroups;
 use crate::proto::{ControlError, Handle, ProcInfo, ProcState, RestartPolicy, Spec};
+use crate::sandbox::Sandbox;
 use crate::store::{Loaded, Store};
 
 /// Broadcast capacity (chunks) and per-read chunk size for stdout fan-out.
@@ -41,146 +40,6 @@ const DEFAULT_PATH: &str = "/usr/bin:/bin";
 const RESTART_BASE: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(30);
 const STABLE_RESET: Duration = Duration::from_secs(10);
-
-/// Write the calling process's pid into an open `cgroup.procs`, joining that leaf.
-/// Runs in the child after fork, before exec, so it must stay async-signal-safe
-/// (see `CommandExt::pre_exec` Safety docs): `write!` of an integer to a raw file
-/// neither allocates nor locks, unlike `to_string`/`println!`.
-fn join_cgroup(file: &std::fs::File) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let pid = nix::unistd::getpid().as_raw();
-    let mut f: &std::fs::File = file;
-
-    write!(f, "{pid}")
-}
-
-/// The directory to hide from an isolated child: the (canonical) parent of the
-/// store file, so the child can't read the node's secret key. `None` if no store.
-fn store_hide_dir(store: Option<&Store>) -> Option<CString> {
-    let abs = std::fs::canonicalize(store?.path()).ok()?;
-
-    CString::new(abs.parent()?.to_owned().into_os_string().into_vec()).ok()
-}
-
-/// Enter fresh namespaces (user/mount/net/uts/ipc) and hide `store_dir` from the
-/// child. Runs in the child after fork, before exec, so it must stay
-/// async-signal-safe: raw syscalls, c-string literals, stack-formatted ids, no alloc.
-#[cfg(target_os = "linux")]
-fn enter_namespaces(store_dir: Option<&CStr>) -> std::io::Result<()> {
-    use nix::libc;
-
-    fn err() -> std::io::Error {
-        std::io::Error::last_os_error()
-    }
-
-    /// Fixed-capacity sink so `write!` can format into the stack (no alloc); the
-    /// whole buffer is then written in one syscall — the kernel requires uid_map/
-    /// gid_map to be set with a single write(2), so we can't `write!` to the file.
-    struct StackBuf {
-        buf: [u8; 32],
-        len: usize,
-    }
-
-    impl std::fmt::Write for StackBuf {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            let end = self.len + s.len();
-            let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
-            dst.copy_from_slice(s.as_bytes());
-            self.len = end;
-
-            Ok(())
-        }
-    }
-
-    /// Write `"0 <id> 1\n"` (map ns-root → our real id) in one write(2).
-    fn write_map(path: &CStr, id: u32) -> std::io::Result<()> {
-        use std::fmt::Write as _;
-
-        let mut map = StackBuf {
-            buf: [0; 32],
-            len: 0,
-        };
-        let _ = writeln!(map, "0 {id} 1"); // infallible: always fits in 32 bytes
-
-        write_file(path, &map.buf[..map.len])
-    }
-
-    fn write_file(path: &CStr, bytes: &[u8]) -> std::io::Result<()> {
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
-        if fd < 0 {
-            return Err(err());
-        }
-
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        unsafe { libc::close(fd) };
-        if n < 0 {
-            return Err(err());
-        }
-
-        Ok(())
-    }
-
-    fn mnt(
-        src: &CStr,
-        target: &CStr,
-        fstype: *const libc::c_char,
-        flags: libc::c_ulong,
-    ) -> std::io::Result<()> {
-        let r = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                target.as_ptr(),
-                fstype,
-                flags,
-                std::ptr::null(),
-            )
-        };
-        if r != 0 {
-            return Err(err());
-        }
-
-        Ok(())
-    }
-
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-
-    let flags = libc::CLONE_NEWUSER
-        | libc::CLONE_NEWNS
-        | libc::CLONE_NEWNET
-        | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWIPC;
-    if unsafe { libc::unshare(flags) } != 0 {
-        return Err(err());
-    }
-
-    // Single-id self-map: ns root → our real uid/gid (no privilege gained on host).
-    write_file(c"/proc/self/setgroups", b"deny")?;
-    write_map(c"/proc/self/uid_map", uid)?;
-    write_map(c"/proc/self/gid_map", gid)?;
-
-    // Contain mount propagation, then hide the store directory from the child.
-    mnt(
-        c"none",
-        c"/",
-        std::ptr::null(),
-        libc::MS_REC | libc::MS_PRIVATE,
-    )?;
-
-    if let Some(dir) = store_dir {
-        mnt(c"tmpfs", dir, c"tmpfs".as_ptr(), 0)?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn enter_namespaces(_store_dir: Option<&CStr>) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "namespace isolation is Linux-only",
-    ))
-}
 
 /// On reload a `Running` child is actually dead (it died with the old supervisor).
 fn reloaded(state: ProcState) -> ProcState {
@@ -385,45 +244,9 @@ impl ProcessManager {
             .process_group(0); // own group: signals reach the child and its descendants
 
         // Per-child sandbox, applied in the child after fork, before exec.
-        let (memory, cpu) = (spec.limits.memory, spec.limits.cpu);
-        let isolate = spec.isolate;
-        let store_dir = isolate
-            .then(|| store_hide_dir(self.0.store.as_ref()))
-            .flatten();
+        let sandbox = Sandbox::new(&spec.limits, spec.isolate, cg_procs, self.0.store.as_ref());
         unsafe {
-            command.pre_exec(move || {
-                use nix::sys::resource::{Resource, setrlimit};
-
-                // die if the supervisor dies, even on SIGKILL. Tied to the
-                // spawning worker thread, which lives for the runtime's lifetime.
-                #[cfg(target_os = "linux")]
-                nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-
-                // Portable address-space cap (blunt; cgroup memory.max is accurate).
-                if let Some(bytes) = memory {
-                    setrlimit(Resource::RLIMIT_AS, bytes, bytes)
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
-                // Portable total-CPU-time cap: SIGKILL after this many CPU seconds.
-                if let Some(secs) = cpu {
-                    setrlimit(Resource::RLIMIT_CPU, secs, secs)
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
-                // Join our cgroup leaf before exec, so memory.max covers exec-time
-                // pages and they're charged to the leaf (accurate memory.current).
-                if let Some(f) = &cg_procs {
-                    join_cgroup(f)?;
-                }
-
-                // Last, drop into fresh namespaces (so the cgroup join above still
-                // runs with host privileges).
-                if isolate {
-                    enter_namespaces(store_dir.as_deref())?;
-                }
-
-                Ok(())
-            });
+            command.pre_exec(move || sandbox.apply());
         }
 
         let mut child = match command.spawn() {
