@@ -3,7 +3,10 @@
 use std::future::Future;
 
 use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{
+    Endpoint, EndpointAddr,
+    endpoint::{Connection, RecvStream, SendStream},
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::ClientConfig;
@@ -36,6 +39,29 @@ where
     unreachable!()
 }
 
+/// Dial `target` on the control ALPN and open a bi-directional stream,
+/// retrying transport setup with exponential backoff.
+async fn connect_bi(
+    endpoint: &Endpoint,
+    target: &EndpointAddr,
+    cfg: &ClientConfig,
+) -> Result<(Connection, SendStream, RecvStream)> {
+    with_retry(cfg, || async {
+        let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
+        let (send, recv) = conn.open_bi().await?;
+        Ok((conn, send, recv))
+    })
+    .await
+}
+
+/// Read one framed `Response` within the configured timeout; `what` names the
+/// awaited reply in the timeout error.
+async fn read_response(recv: &mut RecvStream, cfg: &ClientConfig, what: &str) -> Result<Response> {
+    tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(recv))
+        .await
+        .with_context(|| format!("timed out waiting for {what}"))?
+}
+
 /// Dial `target`, send `req`, and return the supervisor's response.
 ///
 /// `target` accepts a bare `EndpointId` (resolved via mDNS) or a full `EndpointAddr`.
@@ -48,17 +74,10 @@ pub async fn request(
     cfg: &ClientConfig,
 ) -> Result<Response> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(cfg, || async {
-        let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
-        let (send, recv) = conn.open_bi().await?;
-        Ok((conn, send, recv))
-    })
-    .await?;
+    let (conn, mut send, mut recv) = connect_bi(endpoint, &target, cfg).await?;
 
     write_msg(&mut send, &req).await?;
-    let resp = tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
-        .await
-        .context("timed out waiting for response")??;
+    let resp = read_response(&mut recv, cfg, "response").await?;
 
     conn.close(0u32.into(), b"done");
 
@@ -79,18 +98,10 @@ pub async fn subscribe(
     cfg: &ClientConfig,
 ) -> Result<()> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(cfg, || async {
-        let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
-        let (send, recv) = conn.open_bi().await?;
-        Ok((conn, send, recv))
-    })
-    .await?;
+    let (conn, mut send, mut recv) = connect_bi(endpoint, &target, cfg).await?;
 
     write_msg(&mut send, &Request::Subscribe { id }).await?;
-    match tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
-        .await
-        .context("timed out waiting for subscribe ack")??
-    {
+    match read_response(&mut recv, cfg, "subscribe ack").await? {
         Response::Ack => {}
         Response::Error(e) => bail!("subscribe rejected: {e:?}"),
         other => bail!("unexpected response: {other:?}"),
@@ -116,21 +127,13 @@ pub async fn stdin_stream(
     cfg: &ClientConfig,
 ) -> Result<()> {
     let target = target.into();
-    let (conn, mut send, mut recv) = with_retry(cfg, || async {
-        let conn = endpoint.connect(target.clone(), CONTROL_ALPN).await?;
-        let (send, recv) = conn.open_bi().await?;
-        Ok((conn, send, recv))
-    })
-    .await?;
+    let (conn, mut send, mut recv) = connect_bi(endpoint, &target, cfg).await?;
 
     write_msg(&mut send, &Request::StdinStream { id }).await?;
     tokio::io::copy(input, &mut send).await?;
     send.finish()?;
 
-    match tokio::time::timeout(cfg.read_timeout, read_msg::<Response>(&mut recv))
-        .await
-        .context("timed out waiting for stdin response")??
-    {
+    match read_response(&mut recv, cfg, "stdin response").await? {
         Response::Ack => {}
         Response::Error(e) => bail!("stdin stream rejected: {e:?}"),
         other => bail!("unexpected response: {other:?}"),
