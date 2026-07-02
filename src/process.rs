@@ -1,4 +1,4 @@
-//! Spawns and tracks child processes. M4: spawn, reap, query, signal, stdin.
+//! Spawns and tracks child processes: spawn, reap, restart, signal, stdin/stdout.
 
 use std::{
     collections::HashMap,

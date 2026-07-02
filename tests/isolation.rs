@@ -1,4 +1,4 @@
-//! M8: per-child cgroup v2 memory cap + teardown. Skipped where cgroup delegation
+//! Per-child cgroup v2 memory cap + teardown. Skipped where cgroup delegation
 //! is unavailable (non-Linux, no systemd user subtree), so it stays portable.
 
 use std::{

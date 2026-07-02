@@ -1,4 +1,4 @@
-//! Shared wire protocol: control ALPN, request/response types, JSON framing.
+//! Shared wire protocol: control ALPN, request/response types, postcard framing.
 
 use anyhow::Result;
 use iroh::endpoint::{RecvStream, SendStream};
@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 /// Control-plane ALPN. Trailing `/1` is the version — mismatches fail at handshake.
 pub const CONTROL_ALPN: &[u8] = b"/supervisor/control/1";
 
-/// Max bytes for a single framed message (M2: one request/response per stream).
+/// Max bytes for a single framed message (one request/response per stream).
 pub const MAX_FRAME: usize = 64 * 1024;
 
 /// Ephemeral, supervisor-local id. Mesh-wide id = (EndpointId, Handle).
@@ -150,7 +150,7 @@ pub enum ControlError {
 }
 
 /// Write one length-prefixed (u32 BE) postcard message. The single framing for
-/// every request and response
+/// every request and response.
 pub async fn write_msg<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 

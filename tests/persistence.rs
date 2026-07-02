@@ -1,4 +1,4 @@
-//! M7: process records and node identity survive a supervisor restart.
+//! Process records and node identity survive a supervisor restart.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -23,7 +23,7 @@ async fn process_state_survives_restart() {
     let path = temp_store_path();
     let _ = std::fs::remove_file(&path);
 
-    // The record is left "running" after a supservisor stops
+    // The record is left "running" after a supervisor stops
     {
         let store = Store::open(&path).expect("store open failed");
         store
