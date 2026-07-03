@@ -2,6 +2,14 @@
 name = "mesh-supervisor"
 version = "0.1.0"
 edition = "2024"
+description = "Distributed process control and telemetry over an iroh (QUIC) P2P mesh"
+repository = "https://github.com/cbass-d/mesh-supervisor"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["p2p", "iroh", "supervisor", "process", "telemetry"]
+categories = ["command-line-utilities", "network-programming"]
+# Distributed via GitHub Releases, not crates.io; drop this to publish there.
+publish = false
 
 [dependencies]
 anyhow = "1.0.102"

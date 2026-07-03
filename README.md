@@ -1,5 +1,7 @@
 # mesh-supervisor
 
+[![CI](https://github.com/cbass-d/mesh-supervisor/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/cbass-d/mesh-supervisor/actions/workflows/ci.yml)
+
 A distributed process-control + telemetry plane over an [iroh](https://iroh.computer) (QUIC) P2P mesh.
 
 Each node runs a **supervisor** that owns an iroh endpoint and the local child
@@ -76,7 +78,7 @@ for LAN-only.
 - `supervise [--store <path>] (--allow <id>... | --allow-read <id>... | --open) [peer...]` —
   run a supervisor. Authz is deny-by-default: `--allow` = full control, `--allow-read` = read-only,
   `--open` = accept everyone. `peer` ids bootstrap the gossip mesh.
-- `spawn <id> [--mem <size>] [--pids <n>] [--cpu <secs>] [--restart <policy>] [--max-retries <n>] -- <cmd...>` —
+- `spawn <id> [--mem <size>] [--pids <n>] [--cpu <secs>] [--restart <policy>] [--max-retries <n>] [--isolate] -- <cmd...>` —
   launch a process. `--mem` e.g. `256M` (RLIMIT_AS + cgroup `memory.max`); `--pids` caps process
   count (cgroup `pids.max`, Linux); `--cpu` caps total CPU-seconds (RLIMIT_CPU). `--restart`
   is `never` (default), `on-failure` (non-zero exit or signal), or `always`; `--max-retries`
@@ -145,3 +147,16 @@ topic, env `P2P_TOPIC_SECRET`) apply to every subcommand.
 - Wire format is binary **postcard** on both planes (control frames and signed
   telemetry ticks) and for the on-disk store records — compact, deterministic
   (clean to sign over), one `serde` swap from the original JSON.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
