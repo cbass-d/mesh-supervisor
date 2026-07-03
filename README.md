@@ -18,7 +18,7 @@ that dial a supervisor by its `EndpointId` and issue control requests, or as
 
 ## Install
 
-Pre-built binaries for Linux x86_64 and macOS (x86_64 / Apple Silicon) are attached to each [GitHub Release](https://github.com/cbass-d/mesh-supervisor/releases).
+Pre-built binaries for Linux x86_64 are attached to each [GitHub Release](https://github.com/cbass-d/mesh-supervisor/releases).
 
 ```sh
 # One-line installer

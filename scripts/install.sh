@@ -20,14 +20,7 @@ main() {
                 *) err "unsupported architecture: $arch (Linux builds are x86_64 only)" ;;
             esac
             ;;
-        Darwin)
-            case "$arch" in
-                x86_64) target="x86_64-apple-darwin" ;;
-                arm64)  target="aarch64-apple-darwin" ;;
-                *) err "unsupported architecture: $arch" ;;
-            esac
-            ;;
-        *) err "unsupported OS: $os" ;;
+        *) err "unsupported OS: $os (pre-built binaries are Linux x86_64 only)" ;;
     esac
 
     local asset="${BIN}-${target}"
@@ -102,15 +95,9 @@ download() {
 # The checksum file holds a bare filename, so -c must run inside the directory.
 verify_checksum() {
     local dir=$1 asset=$2
-    if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$dir" && sha256sum -c "${asset}.sha256" >/dev/null 2>&1) \
-            || err "checksum verification failed for ${asset}"
-    elif command -v shasum >/dev/null 2>&1; then
-        (cd "$dir" && shasum -a 256 -c "${asset}.sha256" >/dev/null 2>&1) \
-            || err "checksum verification failed for ${asset}"
-    else
-        err "sha256sum or shasum is required to verify the download"
-    fi
+    command -v sha256sum >/dev/null 2>&1 || err "sha256sum is required to verify the download"
+    (cd "$dir" && sha256sum -c "${asset}.sha256" >/dev/null 2>&1) \
+        || err "checksum verification failed for ${asset}"
     say "Checksum verified"
 }
 
