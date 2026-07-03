@@ -36,7 +36,9 @@ main() {
     say "Installing ${BIN} ${version} for ${target}"
 
     tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' EXIT
+    # ${tmp_dir:-}: the EXIT trap runs at top level, where main's locals are
+    # out of scope — a bare $tmp_dir would abort under `set -u`.
+    trap 'rm -rf "${tmp_dir:-}"' EXIT
 
     download "https://github.com/${REPO}/releases/download/${version}/${asset}" "${tmp_dir}/${asset}"
     download "https://github.com/${REPO}/releases/download/${version}/${asset}.sha256" "${tmp_dir}/${asset}.sha256"
