@@ -163,14 +163,6 @@ impl ProcessManager {
         Self::default()
     }
 
-    /// Use a non-default grace period for SIGTERM → SIGKILL escalation.
-    pub fn with_stop_deadline(stop_deadline: Duration) -> Self {
-        Self(Arc::new(Inner {
-            stop_deadline,
-            ..Inner::default()
-        }))
-    }
-
     /// Build from a store: reload tombstoned records and continue the handle counter.
     pub fn with_store(
         store: Store,
@@ -315,8 +307,7 @@ impl ProcessManager {
 
     /// Own the child, record each exit, and relaunch per `spec.policy` with backoff
     /// until the process is stopped, the retry cap is hit, or the supervisor shuts down.
-    async fn supervise(self, id: Handle, spec: Spec, first: Child) {
-        let mut child = first;
+    async fn supervise(self, id: Handle, spec: Spec, mut child: Child) {
         let mut attempt: u32 = 0; // consecutive fast restarts, for backoff + cap
 
         loop {
