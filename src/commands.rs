@@ -56,6 +56,7 @@ where
     let relay = sub.get_one::<RelayUrl>("relay").cloned();
 
     let (endpoint, _book) = endpoint::build_endpoint(vec![], None, relay.clone()).await?;
+
     // Clone the cheap Arc-like endpoint so the streaming future owns its own
     // handle while we retain one to close after it finishes.
     let result = f(endpoint.clone(), dial_addr(target, &relay), cfg).await;
@@ -103,6 +104,7 @@ fn authz_from_matches(sub: &ArgMatches, relay: &Option<RelayUrl>) -> Result<supe
             "no authorization configured: pass --allow <id>... / --allow-read <id>..., or --open to accept all clients"
         );
     }
+
     if open {
         let scope = if relay.is_some() {
             "anyone on the internet who knows this id"
@@ -211,6 +213,7 @@ pub async fn run_supervise(sub: &ArgMatches) -> Result<()> {
             bootstrap,
         )
         .await?;
+
     tokio::spawn(telemetry::publish_loop(
         topic,
         secret_key,

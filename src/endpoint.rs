@@ -26,6 +26,7 @@ pub async fn build_endpoint(
         .alpns(alpns)
         .address_lookup(MdnsAddressLookup::builder())
         .address_lookup(book.clone());
+
     if let Some(key) = secret_key {
         builder = builder.secret_key(key);
     }
