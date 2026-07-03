@@ -275,6 +275,14 @@ pub fn cli() -> Command {
                         .num_args(1..),
                 ),
         ))
+        .subcommand(
+            Command::new("completions")
+                .about("local: print a shell completion script to stdout")
+                .arg(
+                    arg!(<shell> "shell to generate completions for")
+                        .value_parser(clap::value_parser!(clap_complete::Shell)),
+                ),
+        )
 }
 
 #[cfg(test)]
@@ -304,6 +312,7 @@ mod tests {
             vec!["mesh-supervisor", "subscribe", id, "1"],
             vec!["mesh-supervisor", "forget", id, "1"],
             vec!["mesh-supervisor", "watch", id],
+            vec!["mesh-supervisor", "completions", "zsh"],
         ];
 
         for argv in cases {
@@ -311,10 +320,10 @@ mod tests {
                 .try_get_matches_from(&argv)
                 .unwrap_or_else(|e| panic!("{argv:?} failed to parse: {e}"));
             let (name, sub) = matches.subcommand().expect("subcommand required");
-            if name == "supervise" {
-                SupervisorConfig::default().with_cli_overrides(sub);
-            } else {
-                ClientConfig::default().with_cli_overrides(sub);
+            match name {
+                "supervise" => SupervisorConfig::default().with_cli_overrides(sub),
+                "completions" => {} // local-only: no config knobs to apply
+                _ => ClientConfig::default().with_cli_overrides(sub),
             }
         }
     }

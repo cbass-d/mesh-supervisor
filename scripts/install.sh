@@ -59,6 +59,7 @@ main() {
 
     say "Installed ${BIN} to ${dest}"
     say "Run '${BIN} --help' to get started"
+    say "Shell completions: '${BIN} completions <bash|zsh|fish>' prints a script for your shell's completion dir"
 }
 
 fetch_latest_version() {

@@ -404,3 +404,15 @@ pub async fn run_watch(sub: &ArgMatches) -> Result<()> {
 
     Ok(())
 }
+
+/// Local: print a completion script for `shell` to stdout. No endpoint, no network.
+pub fn run_completions(sub: &ArgMatches) -> Result<()> {
+    let shell = *sub
+        .get_one::<clap_complete::Shell>("shell")
+        .expect("required arg");
+    let mut cmd = crate::cli::cli();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+
+    Ok(())
+}

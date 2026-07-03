@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
         Some(("subscribe", sub)) => commands::run_subscribe(sub).await,
         Some(("forget", sub)) => commands::run_forget(sub).await,
         Some(("watch", sub)) => commands::run_watch(sub).await,
+        Some(("completions", sub)) => commands::run_completions(sub),
         _ => unreachable!("subcommand_required(true) guarantees a match"),
     }
 }

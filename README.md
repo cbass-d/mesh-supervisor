@@ -95,6 +95,8 @@ for LAN-only.
 - `watch <bootstrap...>` — join the telemetry topic and print stat ticks live
   (per process: state, memory, and CPU% derived from successive ticks).
 - `forget <id> <handle>` — drop a finished process's record.
+- `completions <shell>` — print a completion script for bash/zsh/fish/etc. to stdout
+  (local; no network). E.g. `mesh-supervisor completions zsh > ~/.zfunc/_mesh-supervisor`.
 
 Global: `--relay <url>` (WAN, env `P2P_RELAY`) and `--topic-secret <s>` (private telemetry
 topic, env `P2P_TOPIC_SECRET`) apply to every subcommand.
