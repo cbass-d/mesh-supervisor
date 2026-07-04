@@ -103,52 +103,32 @@ topic, env `P2P_TOPIC_SECRET`) apply to every subcommand.
 
 ## Design notes
 
-- **Identity & state persist** (redb store, default `mesh-supervisor.redb`): the node's
-  secret key and process records survive a restart, so `EndpointId` and handles are stable.
-  A process that was running when the supervisor died reloads as **Stale** (its child is
-  gone — children die with the supervisor; no re-adopt).
-- **Resource isolation** is portable-first: a `--mem` cap is enforced via `RLIMIT_AS`
-  (all Unix, unprivileged) and, on Linux with a delegated cgroup v2 subtree, via an accurate
-  per-child `memory.max`. The child joins its cgroup leaf from `pre_exec` (before `exec`),
-  so the cap covers exec-time pages and `memory.current` accounts the child accurately.
-  Each child runs in its own process group with `PR_SET_PDEATHSIG` so it dies with the
-  supervisor even on a crash; cgroups are torn down on exit and swept on boot.
-- **Restart policy** (in-memory, per supervisor lifetime): `--restart on-failure|always` relaunches
-  a child under the *same handle* (new pid, `restarts` count climbs) with exponential backoff
-  (1s→30s), resetting once it stays up ≥10s, and gives up after `--max-retries` consecutive fast
-  crashes. `stop` disarms the policy so an intentional stop isn't fought; a reloaded (Stale) process
-  is never resurrected. Watch it via the `restarts` field in `list`/`query`/`watch`.
-- **Termination escalates**: `stop` SIGTERMs, then after a grace period SIGKILLs a child that
-  ignored it — targeting the cgroup (`cgroup.kill`) or process group, never a bare (reusable) pid.
-  Shutdown is graceful the same way: SIGTERM all, wait for them to exit (returning as soon as they
-  all do, capped at the grace period), then force any survivors down.
-- **Namespace isolation** (`--isolate`, Linux, opt-in): the child runs in fresh user/mount/net/uts/ipc
-  namespaces, set up unprivileged via a user namespace (single-id self-map to root-in-ns). It gets an
-  empty network namespace (no network) and a private mount namespace where the store's directory is
-  overmounted with an empty tmpfs, so it can't read the node's secret key. Degrades by failing the
-  spawn loudly where unprivileged user namespaces are disabled. Known gaps vs a full container: no PID
-  namespace (`std::process::Command` forks rather than `clone(CLONE_NEWPID)`), and non-store files
-  outside the hidden directory remain readable (no `pivot_root` rootfs).
-- **Telemetry carries live usage**: each tick includes per-process `memory.current` and
-  cumulative `cpu_usec` (raw cgroup counters). The watcher diffs successive ticks for a CPU
-  rate — robust on a lossy channel, where a rate baked into a dropped tick would be lost.
-  On hosts without a cgroup, usage is simply absent (no `/proc` fallback).
-- **Authz** is deny-by-default by cryptographically-verified `EndpointId`: `--allow` (full control),
-  `--allow-read` (read-only), or explicit `--open`. A read-only id can `list`/`query`/`subscribe`
-  but not `spawn`/`signal`/`stdin`/`forget`.
-- **Hardening:** the store (holding the secret key) is `0600`; spawned children get a scrubbed
-  environment (`env_clear` + minimal PATH) so supervisor secrets don't leak; `--pids`/`--cpu`
-  bound runaway/fork-bomb children. authz is deny-by-default with full/read-only
-  roles. The telemetry topic can be made private with `--topic-secret` (topic = `blake3(secret)`,
-  so peers without it can't join/read/inject); without it, telemetry is public. The control plane
-  is rate-limited per peer (token bucket, ~10 req/s, burst 20), and error replies are sanitized —
-  OS/parser detail is logged server-side, never reflected to clients. Spawned children can opt into
-  network + filesystem isolation with `--isolate` (fresh namespaces); without it they still run as
-  the supervisor's user. Remaining for hostile multi-tenant use: PID-namespace isolation and a full
-  `pivot_root` filesystem jail (today `--isolate` hides only the store directory).
-- Wire format is binary **postcard** on both planes (control frames and signed
-  telemetry ticks) and for the on-disk store records — compact, deterministic
-  (clean to sign over), one `serde` swap from the original JSON.
+- **Identity & state persist** (redb store): the node's secret key and process records
+  survive a restart, so `EndpointId` and handles are stable. A process that was running
+  reloads as **Stale** — children die with the supervisor and are never re-adopted.
+- **Resource caps are portable-first**: rlimits everywhere (`RLIMIT_AS`, `RLIMIT_CPU`),
+  accurate cgroup v2 caps (`memory.max`, `pids.max`) on Linux with a delegated subtree.
+  Each child gets its own process group, joins its cgroup leaf before `exec`, and carries
+  `PR_SET_PDEATHSIG` so it dies with the supervisor even on a crash.
+- **Restart policy**: `--restart on-failure|always` relaunches under the same handle with
+  exponential backoff (1s→30s, reset after 10s stable), giving up after `--max-retries`
+  consecutive fast crashes. `stop` disarms the policy; a Stale process is never resurrected.
+- **Termination escalates**: SIGTERM, then after a grace period SIGKILL — targeting the
+  cgroup (`cgroup.kill`) or process group, never a bare (reusable) pid. Supervisor shutdown
+  drains all children the same way.
+- **`--isolate`** (Linux, opt-in) puts the child in fresh user/mount/net/uts/ipc namespaces,
+  set up unprivileged: no network, and the node's secret-key store is hidden under a tmpfs.
+  Known gaps vs a full container: no PID namespace, no `pivot_root` rootfs.
+- **Telemetry ticks carry raw counters** (`memory.current` gauge, cumulative `cpu_usec`);
+  the watcher diffs successive ticks for a CPU rate, so a dropped tick loses nothing.
+  Without a cgroup, usage is simply absent (no `/proc` fallback).
+- **Security posture**: authz is deny-by-default by cryptographically verified `EndpointId`
+  (`--allow` full control, `--allow-read` read-only, `--open` explicit). The store holding
+  the secret key is `0600`; children get a scrubbed environment (`env_clear` + minimal PATH);
+  the control plane is rate-limited per peer and error replies are sanitized. `--topic-secret`
+  makes the telemetry topic private (topic = `blake3(secret)`); without it telemetry is public.
+- **Wire format is postcard** on both planes and in the on-disk store — compact and
+  deterministic (clean to sign over).
 
 ## License
 
